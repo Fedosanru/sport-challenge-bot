@@ -35,7 +35,9 @@ from openpyxl.utils import get_column_letter
 from db import Challenge, Database
 
 
-load_dotenv()
+from pathlib import Path
+dotenv_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path, override=False)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "sport_challenge.db")
