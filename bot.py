@@ -131,6 +131,18 @@ def main_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def group_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[
+            KeyboardButton(text="🏆 Общий рейтинг"),
+            KeyboardButton(text="📊 Статистика челленджа"),
+        ]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите рейтинг или статистику",
+    )
+
+
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -496,7 +508,12 @@ def create_excel(challenge: Challenge) -> bytes:
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await redirect_to_private(message, bot):
+    if not is_private_chat(message):
+        await state.clear()
+        await message.answer(
+            "В общей группе доступны рейтинг и общая статистика челленджа.",
+            reply_markup=group_keyboard(),
+        )
         return
     await state.clear()
     if not message.from_user:
@@ -767,13 +784,65 @@ async def my_stats(message: Message, bot: Bot) -> None:
 @router.message(F.text == "🏆 Общий рейтинг")
 @router.message(Command("rating"))
 async def rating(message: Message, bot: Bot) -> None:
-    if await redirect_to_private(message, bot):
-        return
     challenge = db.get_active_challenge()
     if not challenge:
         await message.answer("Сейчас нет активного челленджа.")
         return
-    await message.answer(build_ranking_text(challenge))
+    await message.answer(
+        build_ranking_text(challenge),
+        reply_markup=(group_keyboard() if not is_private_chat(message) else None),
+    )
+
+
+def build_challenge_stats_text(challenge: Challenge) -> str:
+    ranking = db.get_ranking(challenge.id)
+    all_users = db.get_all_users()
+    target = min(now_local().date(), date.fromisoformat(challenge.end_date))
+    daily = db.get_daily_results(challenge.id, target.isoformat())
+
+    participants = len(all_users)
+    submitted_today = len(daily)
+    participation = (submitted_today / participants * 100) if participants else 0
+
+    total_pushups = sum(int(row["pushups"] or 0) for row in ranking)
+    total_pullups = sum(int(row["pullups"] or 0) for row in ranking)
+    total_squats = sum(int(row["squats"] or 0) for row in ranking)
+    total_points = sum(float(row["points"] or 0) for row in ranking)
+    total_days = sum(int(row["days"] or 0) for row in ranking)
+    perfect_days = sum(int(row["perfect_days"] or 0) for row in ranking)
+
+    leader = ranking[0]["full_name"] if ranking else "пока нет"
+    leader_points = float(ranking[0]["points"] or 0) if ranking else 0
+
+    return (
+        f"📊 <b>Статистика челленджа</b>\n\n"
+        f"Участников: <b>{participants}</b>\n"
+        f"Внесли результат за {target:%d.%m}: "
+        f"<b>{submitted_today} из {participants}</b> ({participation:.0f}%)\n"
+        f"Всего тренировочных дней: <b>{total_days}</b>\n"
+        f"Идеальных дней: <b>{perfect_days}</b>\n\n"
+        f"💪 Отжимания: <b>{total_pushups}</b>\n"
+        f"🦍 Подтягивания: <b>{total_pullups}</b>\n"
+        f"🦵 Приседания: <b>{total_squats}</b>\n"
+        f"⭐ Общие баллы: <b>{total_points:.2f}</b>\n\n"
+        f"Лидер: <b>{escape(str(leader))}</b> — {leader_points:.2f} балла"
+    )
+
+
+@router.message(F.text == "📊 Статистика челленджа")
+@router.message(Command("stats"))
+async def challenge_stats(message: Message, bot: Bot) -> None:
+    challenge = db.get_active_challenge()
+    if not challenge:
+        await message.answer(
+            "Сейчас нет активного челленджа.",
+            reply_markup=(group_keyboard() if not is_private_chat(message) else None),
+        )
+        return
+    await message.answer(
+        build_challenge_stats_text(challenge),
+        reply_markup=(group_keyboard() if not is_private_chat(message) else None),
+    )
 
 
 @router.message(F.text.in_({"🏅 Рейтинг недели", "🏅 Недельный рейтинг"}))
@@ -1008,13 +1077,17 @@ async def group_fallback(message: Message, bot: Bot) -> None:
     if not text:
         return
     private_actions = {
-        "📝 Внести результат", "📊 Моя статистика", "🏆 Общий рейтинг",
+        "📝 Внести результат", "📊 Моя статистика",
         "📅 Результаты по дням", "🏅 Рейтинг недели", "🏅 Мои достижения", "🔔 Напоминания",
         "ℹ️ Правила", "🛠 Админ-панель", "➕ Новый челлендж",
         "🏁 Завершить", "👀 Кто не внёс", "📥 Excel",
         "🏅 Недельный рейтинг", "🏆 Итоговые номинации",
         "⬅️ Главное меню",
     }
+    public_commands = {"/start", "/rating", "/stats", "/id"}
+    command = text.split("@", 1)[0].split()[0] if text.startswith("/") else ""
+    if command in public_commands:
+        return
     if text.startswith("/") or text in private_actions:
         await redirect_to_private(message, bot)
 
@@ -1093,6 +1166,7 @@ async def main() -> None:
         [
             BotCommand(command="start", description="Запустить бота"),
             BotCommand(command="rating", description="Общий рейтинг"),
+            BotCommand(command="stats", description="Статистика челленджа"),
             BotCommand(command="cancel", description="Отменить действие"),
             BotCommand(command="id", description="Показать Telegram ID"),
         ]
