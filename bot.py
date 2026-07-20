@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -84,6 +84,31 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def is_private_chat(message: Message) -> bool:
+    return message.chat.type == ChatType.PRIVATE
+
+
+def private_chat_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(
+            text="Открыть личный чат с ботом",
+            url=f"https://t.me/{bot_username}?start=private",
+        )]]
+    )
+
+
+async def redirect_to_private(message: Message, bot: Bot) -> bool:
+    if is_private_chat(message):
+        return False
+    me = await bot.get_me()
+    await message.answer(
+        "Личные результаты, статистика и настройки доступны только "
+        "в личном чате с ботом.",
+        reply_markup=private_chat_keyboard(me.username),
+    )
+    return True
+
+
 def main_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="📝 Внести результат")],
@@ -96,9 +121,10 @@ def main_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="🏅 Рейтинг недели"),
         ],
         [
+            KeyboardButton(text="🏅 Мои достижения"),
             KeyboardButton(text="🔔 Напоминания"),
-            KeyboardButton(text="ℹ️ Правила"),
         ],
+        [KeyboardButton(text="ℹ️ Правила")],
     ]
     if admin:
         rows.append([KeyboardButton(text="🛠 Админ-панель")])
@@ -179,6 +205,13 @@ def weekly_range(challenge: Challenge, reference: date | None = None) -> tuple[i
     return week_number, week_start, week_end
 
 
+def progress_bar(value: float, maximum: float, width: int = 12) -> str:
+    if maximum <= 0:
+        return "░" * width
+    filled = min(width, max(0, round((value / maximum) * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
 def build_ranking_text(
     challenge: Challenge,
     date_from: str | None = None,
@@ -190,17 +223,25 @@ def build_ranking_text(
     if not rows:
         return f"<b>{escape(title)}</b>\n\nПока результатов нет."
 
+    leader_points = float(rows[0]["points"])
     lines = [f"<b>{escape(title)}</b>", ""]
     medals = ["🥇", "🥈", "🥉"]
     for index, row in enumerate(rows, start=1):
-        marker = medals[index - 1] if index <= 3 else f"{index}."
-        lines.append(
-            f"{marker} <b>{escape(row['full_name'])}</b> — "
-            f"{row['points']:.2f}\n"
-            f"   Дней: {row['days']} · Отж.: {row['pushups']} · "
-            f"Подт.: {row['pullups']} · Присед.: {row['squats']}"
-        )
-    return "\n".join(lines)
+        marker = medals[index - 1] if index <= 3 else f"{index}️⃣"
+        points = float(row["points"])
+        bar = progress_bar(points, leader_points)
+        trend = ""
+        if index == 1:
+            trend = " · лидер"
+        elif leader_points > points:
+            trend = f" · до лидера {leader_points - points:.2f}"
+        lines.extend([
+            f"{marker} <b>{escape(row['full_name'])}</b> — <b>{points:.2f}</b>{trend}",
+            f"<code>{bar}</code>",
+            f"⭐ {row['perfect_days']} · 🔥 {db.calculate_streaks(challenge.id, row['telegram_id'], min(today_iso(), challenge.end_date))[0]} · дней {row['days']}",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
 
 
 def build_weekly_text(challenge: Challenge, reference: date | None = None) -> str:
@@ -269,6 +310,108 @@ def build_nominations_text(challenge: Challenge) -> str:
         f"🔥 Самая длинная серия — <b>{escape(streak_name)}</b> "
         f"({streak_days} дн.)"
     )
+
+
+def evaluate_achievements(
+    challenge: Challenge, user_id: int, result_date: str
+) -> list[tuple[str, str]]:
+    stats = db.get_user_stats(challenge.id, user_id)
+    if not stats:
+        return []
+    current_streak, max_streak = db.calculate_streaks(
+        challenge.id, user_id, result_date
+    )
+    rank, _ = db.get_user_rank(challenge.id, user_id)
+    recent = db.get_user_recent_results(challenge.id, user_id, 1)
+    perfect_today = bool(recent and abs(float(recent[0]["points"]) - 3.0) < 0.0001)
+
+    candidates = [
+        ("first_result", "🥉 Первый результат", "Первый шаг в челлендже сделан", stats["days"] >= 1),
+        ("streak_3", "🔥 Серия 3 дня", "Три дня подряд без пропусков", max_streak >= 3),
+        ("streak_7", "🔥🔥 Серия 7 дней", "Неделя подряд без пропусков", max_streak >= 7),
+        ("streak_14", "🔥🔥🔥 Серия 14 дней", "Две недели подряд без пропусков", max_streak >= 14),
+        ("streak_21", "👑 Серия 21 день", "Весь челлендж без пропусков", max_streak >= 21),
+        ("pushups_100", "💪 Первые 100 отжиманий", "Суммарно выполнено 100 отжиманий", stats["pushups"] >= 100),
+        ("pushups_1000", "💪 1000 отжиманий", "Суммарно выполнено 1000 отжиманий", stats["pushups"] >= 1000),
+        ("pushups_5000", "💪 5000 отжиманий", "Суммарно выполнено 5000 отжиманий", stats["pushups"] >= 5000),
+        ("pullups_100", "🦍 100 подтягиваний", "Суммарно выполнено 100 подтягиваний", stats["pullups"] >= 100),
+        ("pullups_500", "🦍 500 подтягиваний", "Суммарно выполнено 500 подтягиваний", stats["pullups"] >= 500),
+        ("pullups_1000", "🦍 1000 подтягиваний", "Суммарно выполнено 1000 подтягиваний", stats["pullups"] >= 1000),
+        ("squats_1000", "🦵 1000 приседаний", "Суммарно выполнено 1000 приседаний", stats["squats"] >= 1000),
+        ("squats_5000", "🦵 5000 приседаний", "Суммарно выполнено 5000 приседаний", stats["squats"] >= 5000),
+        ("perfect_1", "⭐ Идеальный день", "Достигнут дневной максимум по всем упражнениям", perfect_today),
+        ("top_3", "🥉 Вошёл в ТОП-3", "Место среди трёх лидеров", rank is not None and rank <= 3),
+        ("leader", "🥇 Лидер рейтинга", "Первое место в общем рейтинге", rank == 1),
+    ]
+    awarded: list[tuple[str, str]] = []
+    for key, title, description, condition in candidates:
+        if condition and db.award_achievement(
+            challenge.id, user_id, key, title, description
+        ):
+            awarded.append((title, description))
+    return awarded
+
+
+def build_achievements_text(challenge: Challenge, user_id: int) -> str:
+    rows = db.get_user_achievements(challenge.id, user_id)
+    if not rows:
+        return "🏅 <b>Мои достижения</b>\n\nПока достижений нет. Первый результат уже откроет первую награду."
+    lines = ["🏅 <b>Мои достижения</b>", ""]
+    for row in rows:
+        lines.append(f"{escape(row['title'])}\n<i>{escape(row['description'])}</i>\n")
+    lines.append(f"Всего: <b>{len(rows)}</b>")
+    return "\n".join(lines)
+
+
+def build_coach_text(challenge: Challenge, user_id: int, result_date: str) -> str:
+    recent = list(reversed(db.get_user_recent_results(challenge.id, user_id, 7)))
+    stats = db.get_user_stats(challenge.id, user_id)
+    ranking = db.get_ranking(challenge.id)
+    rank, total = db.get_user_rank(challenge.id, user_id)
+    if not recent or not stats:
+        return ""
+
+    today = recent[-1]
+    suggestions: list[str] = []
+    missing = [
+        (challenge.pushup_limit - today["pushups"], "отжиманий"),
+        (challenge.pullup_limit - today["pullups"], "подтягиваний"),
+        (challenge.squat_limit - today["squats"], "приседаний"),
+    ]
+    positive_missing = [(value, name) for value, name in missing if value > 0]
+    if positive_missing:
+        value, name = min(positive_missing, key=lambda item: item[0])
+        suggestions.append(f"Ближайшая цель: ещё <b>{value} {name}</b> до дневного максимума.")
+    else:
+        suggestions.append("Сегодня идеальный день: достигнут максимум по всем трём упражнениям.")
+
+    if len(recent) >= 4:
+        first = sum(float(row["points"]) for row in recent[:3]) / 3
+        last = sum(float(row["points"]) for row in recent[-3:]) / 3
+        if last > first + 0.15:
+            suggestions.append(f"Средний результат растёт: <b>+{((last / first) - 1) * 100:.0f}%</b> к началу периода." if first else "Результаты заметно растут.")
+        elif last < first - 0.15:
+            suggestions.append("Последние результаты снизились. Сохраните регулярность и не пытайтесь резко компенсировать объём.")
+
+    if rank is not None and total > 1:
+        if rank == 1:
+            suggestions.append("Вы сейчас лидер. Главная задача — не пропускать дни.")
+        else:
+            current_points = next(float(row["points"]) for row in ranking if row["telegram_id"] == user_id)
+            ahead = float(ranking[rank - 2]["points"])
+            suggestions.append(f"До следующего места осталось <b>{ahead - current_points:.2f} балла</b>.")
+
+    milestones = [
+        (stats["pushups"], 1000, "отжиманий"),
+        (stats["pullups"], 500, "подтягиваний"),
+        (stats["squats"], 1000, "приседаний"),
+    ]
+    close = [(target-current, target, name) for current, target, name in milestones if 0 < target-current <= max(150, target*0.2)]
+    if close:
+        left, target, name = min(close)
+        suggestions.append(f"До достижения «{target} {name}» осталось <b>{left}</b>.")
+
+    return "🤖 <b>Умный тренер</b>\n\n" + "\n".join(f"• {item}" for item in suggestions[:4])
 
 
 def build_final_text(challenge: Challenge) -> str:
@@ -352,7 +495,9 @@ def create_excel(challenge: Challenge) -> bytes:
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext) -> None:
+async def start(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     await state.clear()
     if not message.from_user:
         return
@@ -370,14 +515,19 @@ async def start(message: Message, state: FSMContext) -> None:
 @router.message(Command("id"))
 async def show_id(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else 0
-    await message.answer(
-        f"Ваш Telegram ID: <code>{user_id}</code>\n"
-        f"ID этого чата: <code>{message.chat.id}</code>"
-    )
+    if is_private_chat(message):
+        await message.answer(
+            f"Ваш Telegram ID: <code>{user_id}</code>\n"
+            f"ID этого чата: <code>{message.chat.id}</code>"
+        )
+    else:
+        await message.answer(f"ID общего чата: <code>{message.chat.id}</code>")
 
 
 @router.message(F.text == "📝 Внести результат")
-async def choose_result_date(message: Message, state: FSMContext) -> None:
+async def choose_result_date(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user:
         return
     db.upsert_user(
@@ -441,6 +591,8 @@ async def select_result_date(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(ResultForm.pushups)
 async def input_pushups(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message):
+        return
     challenge = db.get_active_challenge()
     if not challenge:
         await state.clear()
@@ -456,6 +608,8 @@ async def input_pushups(message: Message, state: FSMContext) -> None:
 
 @router.message(ResultForm.pullups)
 async def input_pullups(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message):
+        return
     challenge = db.get_active_challenge()
     if not challenge:
         await state.clear()
@@ -471,6 +625,8 @@ async def input_pullups(message: Message, state: FSMContext) -> None:
 
 @router.message(ResultForm.squats)
 async def input_squats(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message):
+        return
     challenge = db.get_active_challenge()
     if not challenge:
         await state.clear()
@@ -519,6 +675,12 @@ async def save_confirmed(callback: CallbackQuery, state: FSMContext) -> None:
     current_streak, max_streak = db.calculate_streaks(
         challenge.id, callback.from_user.id, data["result_date"]
     )
+    new_achievements = evaluate_achievements(
+        challenge, callback.from_user.id, data["result_date"]
+    )
+    coach_text = build_coach_text(
+        challenge, callback.from_user.id, data["result_date"]
+    )
     await state.clear()
     if callback.message:
         await callback.message.answer(
@@ -527,6 +689,13 @@ async def save_confirmed(callback: CallbackQuery, state: FSMContext) -> None:
             f"Лучшая серия: {max_streak} дн.",
             reply_markup=main_keyboard(is_admin(callback.from_user.id)),
         )
+        for title, description in new_achievements:
+            await callback.message.answer(
+                f"🎉 <b>Новое достижение!</b>\n\n"
+                f"{escape(title)}\n<i>{escape(description)}</i>"
+            )
+        if coach_text:
+            await callback.message.answer(coach_text)
     await callback.answer()
 
 
@@ -555,7 +724,9 @@ async def cancel_result_callback(callback: CallbackQuery, state: FSMContext) -> 
 
 
 @router.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext) -> None:
+async def cancel(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     await state.clear()
     await message.answer(
         "Действие отменено.",
@@ -564,7 +735,9 @@ async def cancel(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text == "📊 Моя статистика")
-async def my_stats(message: Message) -> None:
+async def my_stats(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user:
         return
     challenge = db.get_active_challenge()
@@ -593,7 +766,9 @@ async def my_stats(message: Message) -> None:
 
 @router.message(F.text == "🏆 Общий рейтинг")
 @router.message(Command("rating"))
-async def rating(message: Message) -> None:
+async def rating(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     challenge = db.get_active_challenge()
     if not challenge:
         await message.answer("Сейчас нет активного челленджа.")
@@ -602,7 +777,9 @@ async def rating(message: Message) -> None:
 
 
 @router.message(F.text.in_({"🏅 Рейтинг недели", "🏅 Недельный рейтинг"}))
-async def weekly_rating(message: Message) -> None:
+async def weekly_rating(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     challenge = db.get_active_challenge()
     if not challenge:
         await message.answer("Сейчас нет активного челленджа.")
@@ -611,7 +788,9 @@ async def weekly_rating(message: Message) -> None:
 
 
 @router.message(F.text == "📅 Результаты по дням")
-async def daily_results(message: Message) -> None:
+async def daily_results(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     challenge = db.get_active_challenge()
     if not challenge:
         await message.answer("Сейчас нет активного челленджа.")
@@ -620,8 +799,23 @@ async def daily_results(message: Message) -> None:
     await message.answer(build_daily_text(challenge, target))
 
 
+@router.message(F.text == "🏅 Мои достижения")
+async def my_achievements(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
+    if not message.from_user:
+        return
+    challenge = db.get_active_challenge()
+    if not challenge:
+        await message.answer("Сейчас нет активного челленджа.")
+        return
+    await message.answer(build_achievements_text(challenge, message.from_user.id))
+
+
 @router.message(F.text == "🔔 Напоминания")
-async def toggle_reminders(message: Message) -> None:
+async def toggle_reminders(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user:
         return
     db.upsert_user(
@@ -636,7 +830,9 @@ async def toggle_reminders(message: Message) -> None:
 
 
 @router.message(F.text == "ℹ️ Правила")
-async def rules(message: Message) -> None:
+async def rules(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     await message.answer(
         "ℹ️ <b>Правила</b>\n\n"
         "Дневные максимумы: 200 отжиманий, 50 подтягиваний, "
@@ -649,14 +845,18 @@ async def rules(message: Message) -> None:
 
 
 @router.message(F.text == "🛠 Админ-панель")
-async def admin_panel(message: Message) -> None:
+async def admin_panel(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user or not is_admin(message.from_user.id):
         return
     await message.answer("Управление челленджем:", reply_markup=admin_keyboard())
 
 
 @router.message(F.text == "⬅️ Главное меню")
-async def main_menu(message: Message, state: FSMContext) -> None:
+async def main_menu(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     await state.clear()
     await message.answer(
         "Главное меню.",
@@ -665,7 +865,9 @@ async def main_menu(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text == "➕ Новый челлендж")
-async def new_challenge_start(message: Message, state: FSMContext) -> None:
+async def new_challenge_start(message: Message, state: FSMContext, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user or not is_admin(message.from_user.id):
         return
     if db.get_active_challenge():
@@ -677,6 +879,8 @@ async def new_challenge_start(message: Message, state: FSMContext) -> None:
 
 @router.message(ChallengeForm.title)
 async def new_challenge_title(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message):
+        return
     title = (message.text or "").strip()
     if not title:
         await message.answer("Название не должно быть пустым.")
@@ -688,6 +892,8 @@ async def new_challenge_title(message: Message, state: FSMContext) -> None:
 
 @router.message(ChallengeForm.start_date)
 async def new_challenge_date(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message):
+        return
     try:
         start = date.fromisoformat((message.text or "").strip())
     except ValueError:
@@ -700,6 +906,8 @@ async def new_challenge_date(message: Message, state: FSMContext) -> None:
 
 @router.message(ChallengeForm.duration)
 async def new_challenge_duration(message: Message, state: FSMContext) -> None:
+    if not is_private_chat(message):
+        return
     try:
         duration = int((message.text or "").strip())
         if not 1 <= duration <= 365:
@@ -728,7 +936,9 @@ async def new_challenge_duration(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text == "👀 Кто не внёс")
-async def missing_today(message: Message) -> None:
+async def missing_today(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user or not is_admin(message.from_user.id):
         return
     challenge = db.get_active_challenge()
@@ -744,7 +954,9 @@ async def missing_today(message: Message) -> None:
 
 
 @router.message(F.text == "📥 Excel")
-async def export_excel(message: Message) -> None:
+async def export_excel(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user or not is_admin(message.from_user.id):
         return
     challenge = db.get_active_challenge()
@@ -760,7 +972,9 @@ async def export_excel(message: Message) -> None:
 
 
 @router.message(F.text == "🏆 Итоговые номинации")
-async def nominations(message: Message) -> None:
+async def nominations(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user or not is_admin(message.from_user.id):
         return
     challenge = db.get_active_challenge()
@@ -773,6 +987,8 @@ async def nominations(message: Message) -> None:
 @router.message(F.text == "🏁 Завершить")
 @router.message(Command("finish"))
 async def finish(message: Message, bot: Bot) -> None:
+    if await redirect_to_private(message, bot):
+        return
     if not message.from_user or not is_admin(message.from_user.id):
         return
     challenge = db.get_active_challenge()
@@ -785,6 +1001,22 @@ async def finish(message: Message, bot: Bot) -> None:
     if chat_id and chat_id != message.chat.id:
         await bot.send_message(chat_id, final_text)
 
+
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def group_fallback(message: Message, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        return
+    private_actions = {
+        "📝 Внести результат", "📊 Моя статистика", "🏆 Общий рейтинг",
+        "📅 Результаты по дням", "🏅 Рейтинг недели", "🏅 Мои достижения", "🔔 Напоминания",
+        "ℹ️ Правила", "🛠 Админ-панель", "➕ Новый челлендж",
+        "🏁 Завершить", "👀 Кто не внёс", "📥 Excel",
+        "🏅 Недельный рейтинг", "🏆 Итоговые номинации",
+        "⬅️ Главное меню",
+    }
+    if text.startswith("/") or text in private_actions:
+        await redirect_to_private(message, bot)
 
 async def background_worker(bot: Bot) -> None:
     while True:

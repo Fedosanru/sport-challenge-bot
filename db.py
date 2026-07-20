@@ -83,6 +83,18 @@ class Database:
                     PRIMARY KEY(challenge_id, notification_key),
                     FOREIGN KEY(challenge_id) REFERENCES challenges(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS achievements (
+                    challenge_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    achievement_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    earned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(challenge_id, user_id, achievement_key),
+                    FOREIGN KEY(challenge_id) REFERENCES challenges(id),
+                    FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+                );
                 """
             )
             # Миграция со старой версии без потери данных.
@@ -389,6 +401,62 @@ class Database:
                 ORDER BY r.result_date, u.full_name
                 """,
                 (challenge_id,),
+            ).fetchall()
+
+    def get_user_recent_results(
+        self, challenge_id: int, user_id: int, limit: int = 7
+    ) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT r.result_date, r.pushups, r.pullups, r.squats,
+                       (
+                         CAST(r.pushups AS REAL) / c.pushup_limit +
+                         CAST(r.pullups AS REAL) / c.pullup_limit +
+                         CAST(r.squats AS REAL) / c.squat_limit
+                       ) AS points
+                FROM results r
+                JOIN challenges c ON c.id = r.challenge_id
+                WHERE r.challenge_id = ? AND r.user_id = ?
+                ORDER BY r.result_date DESC
+                LIMIT ?
+                """,
+                (challenge_id, user_id, limit),
+            ).fetchall()
+
+    def get_user_rank(self, challenge_id: int, user_id: int) -> tuple[int | None, int]:
+        rows = self.get_ranking(challenge_id)
+        for index, row in enumerate(rows, start=1):
+            if row["telegram_id"] == user_id:
+                return index, len(rows)
+        return None, len(rows)
+
+    def award_achievement(
+        self, challenge_id: int, user_id: int, key: str, title: str, description: str
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO achievements(
+                    challenge_id, user_id, achievement_key, title, description
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (challenge_id, user_id, key, title, description),
+            )
+            return cursor.rowcount > 0
+
+    def get_user_achievements(
+        self, challenge_id: int, user_id: int
+    ) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT achievement_key, title, description, earned_at
+                FROM achievements
+                WHERE challenge_id = ? AND user_id = ?
+                ORDER BY earned_at, achievement_key
+                """,
+                (challenge_id, user_id),
             ).fetchall()
 
     def notification_was_sent(self, challenge_id: int, key: str) -> bool:
