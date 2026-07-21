@@ -220,6 +220,18 @@ class Database:
             COALESCE(SUM(CASE WHEN r.pushups=c.pushup_limit AND r.pullups=c.pullup_limit AND r.squats=c.squat_limit THEN 1 ELSE 0 END),0) perfect_days
             FROM challenges c LEFT JOIN results r ON r.challenge_id=c.id WHERE c.id=?""",(challenge_id,today,challenge_id)).fetchone()
 
+    def get_today_group_stats(self,challenge_id:int,today:str)->sqlite3.Row:
+        with self._connect() as conn:
+            return conn.execute("""SELECT
+            (SELECT COUNT(*) FROM group_members gm JOIN challenges c2 ON c2.group_id=gm.group_id WHERE c2.id=?) members,
+            COUNT(DISTINCT r.user_id) active_today,
+            COALESCE(SUM(r.pushups),0) pushups,
+            COALESCE(SUM(r.pullups),0) pullups,
+            COALESCE(SUM(r.squats),0) squats
+            FROM challenges c
+            LEFT JOIN results r ON r.challenge_id=c.id AND r.result_date=?
+            WHERE c.id=?""",(challenge_id,today,challenge_id)).fetchone()
+
     def get_user_stats(self,challenge_id:int,user_id:int)->sqlite3.Row:
         with self._connect() as conn:
             return conn.execute("""SELECT COUNT(r.id) days,COALESCE(SUM(r.pushups),0) pushups,COALESCE(SUM(r.pullups),0) pullups,COALESCE(SUM(r.squats),0) squats,

@@ -27,8 +27,16 @@ class ChallengeForm(StatesGroup): title=State(); start_date=State(); duration=St
 def now(): return datetime.now(TIMEZONE)
 def private(m:Message): return m.chat.type==ChatType.PRIVATE
 
-def group_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='🏆 Общий рейтинг'),KeyboardButton(text='📊 Статистика челленджа')]],resize_keyboard=True,is_persistent=True)
+def group_keyboard(bot_username:str, group_id:int, view:str='rating'):
+    switch_button=(
+        InlineKeyboardButton(text='🏆 Рейтинг',callback_data=f'public_rating:{group_id}')
+        if view=='stats'
+        else InlineKeyboardButton(text='📊 Статистика',callback_data=f'public_stats:{group_id}')
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='📝 Внести результат',url=f'https://t.me/{bot_username}?start=result_{group_id}'),
+        switch_button
+    ]])
 def main_keyboard():
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='🏠 Выбрать группу')],[KeyboardButton(text='📝 Внести результат')],[KeyboardButton(text='📊 Моя статистика'),KeyboardButton(text='🏆 Общий рейтинг')],[KeyboardButton(text='🔔 Напоминания'),KeyboardButton(text='ℹ️ Правила')],[KeyboardButton(text='🛠 Управление группой')]],resize_keyboard=True)
 def group_choice(rows, prefix='group'):
@@ -41,12 +49,45 @@ def confirm_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Сохранить',callback_data='save'),InlineKeyboardButton(text='✏️ Исправить',callback_data='edit')],[InlineKeyboardButton(text='❌ Отмена',callback_data='cancel')]])
 
 def ranking_text(ch:Challenge)->str:
+    today=now().date()
+    start_date=date.fromisoformat(ch.start_date)
+    end_date=date.fromisoformat(ch.end_date)
+    duration=(end_date-start_date).days+1
+    current_day=min(max((today-start_date).days+1,1),duration)
+    days_left=max((end_date-today).days,0)
+    stats=db.get_today_group_stats(ch.id,today.isoformat())
+    members=int(stats['members'] or 0)
+    active=int(stats['active_today'] or 0)
+    pct=round(active/members*100) if members else 0
     rows=db.get_ranking(ch.id)
-    if not rows:return f'<b>🏆 {escape(ch.title)}</b>\n\nПока результатов нет.'
-    medals=['🥇','🥈','🥉']; out=[f'<b>🏆 {escape(ch.title)}</b>','']
-    for i,r in enumerate(rows,1):
-        mark=medals[i-1] if i<=3 else f'{i}.'
-        out.append(f'{mark} <b>{escape(r["full_name"])}</b> — {float(r["points"]):.2f} балла · {r["days"]} дн.')
+
+    out=[
+        f'<b>🏆 {escape(ch.title)}</b>',
+        '━━━━━━━━━━━━━━━━━━',
+        f'📅 День <b>{current_day}</b> из <b>{duration}</b>',
+        f'👥 <b>{members}</b> участников',
+        ''
+    ]
+    if rows:
+        medals=['🥇','🥈','🥉']
+        for i,r in enumerate(rows,1):
+            mark=medals[i-1] if i<=3 else f'{i}.'
+            out.append(f'{mark} <b>{escape(r["full_name"])}</b> — {float(r["points"]):.2f}')
+    else:
+        out.append('Пока результатов нет.')
+
+    out.extend([
+        '',
+        '━━━━━━━━━━━━━━━━━━',
+        f'✅ Сегодня отметились: <b>{active} / {members}</b> ({pct}%)',
+        '',
+        f'🔥 До конца сезона: <b>{days_left}</b> дн.',
+        '',
+        '<b>💪 Сегодня:</b>',
+        f'{int(stats["pushups"] or 0)} отжиманий',
+        f'{int(stats["pullups"] or 0)} подтягиваний',
+        f'{int(stats["squats"] or 0)} приседаний'
+    ])
     return '\n'.join(out)
 def group_stats_text(ch:Challenge)->str:
     s=db.get_group_stats(ch.id,now().date().isoformat()); members=int(s['members'] or 0); active=int(s['active_today'] or 0)
@@ -73,18 +114,23 @@ async def start(message:Message,state:FSMContext,bot:Bot):
             role='admin' if member.status in {'creator','administrator'} or message.from_user.id in ADMIN_IDS else 'member'
             db.add_member(group.id,message.from_user.id,role)
         me=await bot.get_me()
-        join=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Вступить в челлендж',url=f'https://t.me/{me.username}?start=join_{group.id}')]])
-        await message.answer('В этой группе доступны только рейтинг и статистика.',reply_markup=group_keyboard())
-        await message.answer('Участникам нужно один раз связать личный чат с этой группой.',reply_markup=join)
+        await message.answer('Меню челленджа:',reply_markup=group_keyboard(me.username,group.id))
         return
     if not message.from_user:return
     db.upsert_user(message.from_user.id,message.from_user.full_name,message.from_user.username)
     arg=(message.text or '').split(maxsplit=1)
-    if len(arg)>1 and arg[1].startswith('join_'):
-        try: gid=int(arg[1][5:]); g=db.get_group(gid)
+    if len(arg)>1 and (arg[1].startswith('join_') or arg[1].startswith('result_')):
+        action, raw_gid = arg[1].split('_',1)
+        try: gid=int(raw_gid); g=db.get_group(gid)
         except ValueError: g=None
         if g:
             db.add_member(g.id,message.from_user.id); db.set_selected_group(message.from_user.id,g.id)
+            if action=='result':
+                ch=db.get_active_challenge(g.id)
+                if not ch:
+                    await message.answer(f'В группе «{escape(g.title)}» нет активного челленджа.',reply_markup=main_keyboard()); return
+                await state.update_data(group_id=g.id,challenge_id=ch.id)
+                await message.answer(f'Группа: <b>{escape(g.title)}</b>\nЗа какой день внести результат?',reply_markup=result_date_keyboard()); return
             await message.answer(f'✅ Вы присоединились к группе «{escape(g.title)}».',reply_markup=main_keyboard()); return
     groups=db.get_user_groups(message.from_user.id)
     if not groups: await message.answer('Сначала нажмите «Вступить в челлендж» в нужной общей группе.',reply_markup=main_keyboard())
@@ -155,6 +201,26 @@ async def edit(callback:CallbackQuery,state:FSMContext): await state.set_state(R
 @router.callback_query(ResultForm.confirm,F.data=='cancel')
 async def cancel(callback:CallbackQuery,state:FSMContext): await state.clear(); await callback.answer(); await callback.message.answer('Отменено.',reply_markup=main_keyboard())
 
+@router.callback_query(F.data.startswith('public_rating:'))
+async def public_rating(callback:CallbackQuery):
+    gid=int(callback.data.split(':',1)[1]); g=db.get_group(gid)
+    if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:
+        await callback.answer('Группа не найдена',show_alert=True); return
+    ch=db.get_active_challenge(g.id); me=await callback.bot.get_me()
+    text=ranking_text(ch) if ch else 'В этой группе нет активного челленджа.'
+    await callback.message.edit_text(text,reply_markup=group_keyboard(me.username,g.id,'rating'))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('public_stats:'))
+async def public_stats(callback:CallbackQuery):
+    gid=int(callback.data.split(':',1)[1]); g=db.get_group(gid)
+    if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:
+        await callback.answer('Группа не найдена',show_alert=True); return
+    ch=db.get_active_challenge(g.id); me=await callback.bot.get_me()
+    text=group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.'
+    await callback.message.edit_text(text,reply_markup=group_keyboard(me.username,g.id,'stats'))
+    await callback.answer()
+
 @router.message(F.text=='🏆 Общий рейтинг')
 @router.message(Command('rating'))
 async def rating(message:Message):
@@ -163,7 +229,11 @@ async def rating(message:Message):
         g,ch=selected(message.from_user.id)
     else:
         g=await ensure_group(message); ch=db.get_active_challenge(g.id)
-    await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard() if private(message) else group_keyboard())
+    if private(message):
+        await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard())
+    else:
+        me=await message.bot.get_me()
+        await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id))
 
 @router.message(F.text=='📊 Статистика челленджа')
 @router.message(Command('stats'))
@@ -173,7 +243,11 @@ async def stats(message:Message):
         g,ch=selected(message.from_user.id)
     else:
         g=await ensure_group(message); ch=db.get_active_challenge(g.id)
-    await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard() if private(message) else group_keyboard())
+    if private(message):
+        await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard())
+    else:
+        me=await message.bot.get_me()
+        await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id))
 
 @router.message(F.text=='📊 Моя статистика')
 async def my_stats(message:Message):
