@@ -277,12 +277,23 @@ class Database:
         if unknown_ids:
             raise ValueError(f"Неизвестные упражнения: {sorted(unknown_ids)}")
 
+        # Совместимость с базами v10/v11.0. В старых файлах SQLite
+        # pushups/pullups/squats могли быть NOT NULL без DEFAULT. Поэтому
+        # заполняем их явно параллельно с универсальной таблицей result_values.
+        ordered = sorted(exercises, key=lambda e: (e.sort_order, e.id))
+        legacy = [int(round(float(values.get(e.id, 0)))) for e in ordered[:3]]
+        legacy += [0] * (3 - len(legacy))
+        legacy_pushups, legacy_pullups, legacy_squats = legacy
+
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "INSERT INTO results(challenge_id,user_id,result_date) VALUES(?,?,?) "
-                "ON CONFLICT(challenge_id,user_id,result_date) DO UPDATE SET updated_at=CURRENT_TIMESTAMP",
-                (challenge_id,user_id,result_date),
+                "INSERT INTO results(challenge_id,user_id,result_date,pushups,pullups,squats) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(challenge_id,user_id,result_date) DO UPDATE SET "
+                "pushups=excluded.pushups,pullups=excluded.pullups,squats=excluded.squats,"
+                "updated_at=CURRENT_TIMESTAMP",
+                (challenge_id,user_id,result_date,legacy_pushups,legacy_pullups,legacy_squats),
             )
             row = conn.execute(
                 "SELECT id FROM results WHERE challenge_id=? AND user_id=? AND result_date=?",
