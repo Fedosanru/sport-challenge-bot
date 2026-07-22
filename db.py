@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -143,6 +144,15 @@ class Database:
                 challenge_id INTEGER NOT NULL,notification_key TEXT NOT NULL,sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(challenge_id,notification_key)
             );
+            CREATE TABLE IF NOT EXISTS result_drafts(
+                user_id INTEGER PRIMARY KEY,
+                challenge_id INTEGER NOT NULL,
+                result_date TEXT NOT NULL,
+                exercise_index INTEGER NOT NULL DEFAULT 0,
+                values_json TEXT NOT NULL DEFAULT '{}',
+                stage TEXT NOT NULL DEFAULT 'collecting',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """)
             if "group_id" not in self._cols(conn, "challenges"):
                 conn.execute("ALTER TABLE challenges ADD COLUMN group_id INTEGER")
@@ -267,6 +277,27 @@ class Database:
         with self._connect() as conn:
             row=conn.execute("SELECT results_chat_id FROM challenges WHERE id=?",(challenge_id,)).fetchone(); conn.execute("UPDATE challenges SET status='finished' WHERE id=?",(challenge_id,))
         return row['results_chat_id'] if row else None
+
+
+    def save_result_draft(self,user_id:int,challenge_id:int,result_date:str,exercise_index:int,values:dict[int|str,float],stage:str='collecting')->None:
+        payload=json.dumps({str(k):float(v) for k,v in values.items()},ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute("""INSERT INTO result_drafts(user_id,challenge_id,result_date,exercise_index,values_json,stage)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET challenge_id=excluded.challenge_id,
+            result_date=excluded.result_date,exercise_index=excluded.exercise_index,values_json=excluded.values_json,
+            stage=excluded.stage,updated_at=CURRENT_TIMESTAMP""",(user_id,challenge_id,result_date,exercise_index,payload,stage))
+
+    def get_result_draft(self,user_id:int):
+        with self._connect() as conn:
+            row=conn.execute("SELECT user_id,challenge_id,result_date,exercise_index,values_json,stage,updated_at FROM result_drafts WHERE user_id=?",(user_id,)).fetchone()
+        if not row:return None
+        data=dict(row)
+        try:data['values']=json.loads(data.pop('values_json'))
+        except Exception:data['values']={}
+        return data
+
+    def delete_result_draft(self,user_id:int)->None:
+        with self._connect() as conn: conn.execute("DELETE FROM result_drafts WHERE user_id=?",(user_id,))
 
     def save_result(self,challenge_id:int,user_id:int,result_date:str,values:dict[int,float])->None:
         exercises = self.get_exercises(challenge_id)

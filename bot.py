@@ -70,6 +70,12 @@ def result_date_keyboard(edit_days:int,has_yesterday=False):
 def confirm_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Сохранить',callback_data='result:save'),InlineKeyboardButton(text='✏️ Заново',callback_data='result:edit')],[InlineKeyboardButton(text='❌ Отмена',callback_data='result:cancel')]])
 
+def resume_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='▶️ Продолжить',callback_data='draft:resume'),InlineKeyboardButton(text='🔄 Начать заново',callback_data='draft:restart')],[InlineKeyboardButton(text='❌ Отмена',callback_data='result:cancel')]])
+
+def saved_result_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✏️ Изменить результат',callback_data='saved:edit_today')],[InlineKeyboardButton(text='🏆 Рейтинг',callback_data='saved:rating'),InlineKeyboardButton(text='📊 Моя статистика',callback_data='saved:stats')]])
+
 def fmt(v:float)->str: return str(int(v)) if float(v).is_integer() else f'{v:g}'
 
 def selected(user_id:int)->tuple[Group|None,Challenge|None]:
@@ -153,10 +159,36 @@ async def result_start(message:Message,state:FSMContext):
     if not private(message) or not message.from_user:return
     g,ch=selected(message.from_user.id)
     if not ch: await message.answer('В выбранной группе нет активного челленджа.'); return
-    today=now().date();
+    today=now().date()
     if not (date.fromisoformat(ch.start_date)<=today<=date.fromisoformat(ch.end_date)): await message.answer('Сегодня вне дат активного челленджа.'); return
+
+    draft=db.get_result_draft(message.from_user.id)
+    if draft and int(draft['challenge_id'])==ch.id:
+        await message.answer(
+            f'У вас есть незавершённый ввод за <b>{date.fromisoformat(draft["result_date"]):%d.%m.%Y}</b>.',
+            reply_markup=resume_keyboard(),
+        )
+        return
+    if draft:
+        db.delete_result_draft(message.from_user.id)
+
     yesterday=(today-timedelta(days=1)).isoformat(); has=bool(db.get_result(ch.id,message.from_user.id,yesterday))
-    await state.update_data(challenge_id=ch.id); await message.answer('За какой день внести результат?',reply_markup=result_date_keyboard(ch.edit_days,has))
+    await state.update_data(challenge_id=ch.id)
+    await message.answer('За какой день внести результат?',reply_markup=result_date_keyboard(ch.edit_days,has))
+
+async def begin_result_entry(target_message:Message,user_id:int,ch:Challenge,target:date,state:FSMContext,prefill:dict[int,float]|None=None):
+    exercises=db.get_exercises(ch.id)
+    if not exercises:
+        await target_message.answer('У челленджа нет упражнений.')
+        return
+    values={str(k):float(v) for k,v in (prefill or {}).items()}
+    await state.update_data(challenge_id=ch.id,result_date=target.isoformat(),exercise_index=0,values=values)
+    await state.set_state(ResultForm.collecting)
+    db.save_result_draft(user_id,ch.id,target.isoformat(),0,values,'collecting')
+    ex=exercises[0]
+    old=values.get(str(ex.id))
+    suffix=f' Текущее значение: <b>{fmt(old)}</b>.' if old is not None else ''
+    await target_message.answer(f'{escape(ex.name)} — сколько {escape(ex.unit)}? Норма: {fmt(ex.daily_target)}.{suffix}')
 
 @router.callback_query(F.data.startswith('date:'))
 async def result_date(callback:CallbackQuery,state:FSMContext):
@@ -165,8 +197,40 @@ async def result_date(callback:CallbackQuery,state:FSMContext):
     try: target=date.fromisoformat(callback.data.split(':',1)[1])
     except ValueError: return await callback.answer('Неверная дата',show_alert=True)
     if not (date.fromisoformat(ch.start_date)<=target<=date.fromisoformat(ch.end_date)): await callback.answer('Дата вне челленджа',show_alert=True); return
-    exercises=db.get_exercises(ch.id); await state.update_data(result_date=target.isoformat(),exercise_index=0,values={}); await state.set_state(ResultForm.collecting)
-    await callback.answer(); await callback.message.answer(f'{escape(exercises[0].name)} — сколько {escape(exercises[0].unit)}? Норма: {fmt(exercises[0].daily_target)}')
+    existing=db.get_result(ch.id,callback.from_user.id,target.isoformat()) or {}
+    await callback.answer()
+    await begin_result_entry(callback.message,callback.from_user.id,ch,target,state,existing)
+
+@router.callback_query(F.data=='draft:resume')
+async def resume_draft(callback:CallbackQuery,state:FSMContext):
+    draft=db.get_result_draft(callback.from_user.id)
+    if not draft:
+        await callback.answer('Черновик не найден',show_alert=True); return
+    ch=db.get_challenge(int(draft['challenge_id']))
+    if not ch:
+        db.delete_result_draft(callback.from_user.id); await callback.answer('Челлендж не найден',show_alert=True); return
+    values={str(k):float(v) for k,v in draft.get('values',{}).items()}
+    idx=int(draft.get('exercise_index',0)); exercises=db.get_exercises(ch.id)
+    await state.update_data(challenge_id=ch.id,result_date=draft['result_date'],exercise_index=idx,values=values)
+    await callback.answer()
+    if draft.get('stage')=='confirm' or idx>=len(exercises):
+        await state.set_state(ResultForm.confirm)
+        await callback.message.answer(confirm_text(ch,values),reply_markup=confirm_keyboard())
+    else:
+        await state.set_state(ResultForm.collecting)
+        ex=exercises[idx]
+        old=values.get(str(ex.id)); suffix=f' Текущее значение: <b>{fmt(old)}</b>.' if old is not None else ''
+        await callback.message.answer(f'{escape(ex.name)} — сколько {escape(ex.unit)}? Норма: {fmt(ex.daily_target)}.{suffix}')
+
+@router.callback_query(F.data=='draft:restart')
+async def restart_draft(callback:CallbackQuery,state:FSMContext):
+    draft=db.get_result_draft(callback.from_user.id)
+    ch=db.get_challenge(int(draft['challenge_id'])) if draft else None
+    if not ch:
+        await callback.answer('Черновик не найден',show_alert=True); return
+    db.delete_result_draft(callback.from_user.id)
+    await callback.answer()
+    await begin_result_entry(callback.message,callback.from_user.id,ch,date.fromisoformat(draft['result_date']),state,{})
 
 @router.callback_query(F.data=='repeat:yesterday')
 async def repeat_yesterday(callback:CallbackQuery,state:FSMContext):
@@ -174,15 +238,22 @@ async def repeat_yesterday(callback:CallbackQuery,state:FSMContext):
     if not ch:return
     old=db.get_result(ch.id,callback.from_user.id,(now().date()-timedelta(days=1)).isoformat())
     if not old: await callback.answer('Нет результата за вчера',show_alert=True); return
-    await state.update_data(result_date=now().date().isoformat(),values={str(k):v for k,v in old.items()}); await state.set_state(ResultForm.confirm)
+    values={str(k):v for k,v in old.items()}
+    await state.update_data(result_date=now().date().isoformat(),values=values,exercise_index=len(db.get_exercises(ch.id)))
+    await state.set_state(ResultForm.confirm)
+    db.save_result_draft(callback.from_user.id,ch.id,now().date().isoformat(),len(db.get_exercises(ch.id)),values,'confirm')
     await callback.answer(); await callback.message.answer(confirm_text(ch,old),reply_markup=confirm_keyboard())
 
-def parse_value(message:Message,target:float)->float|None:
-    try: v=float((message.text or '').replace(',','.')); return v if 0<=v<=target*10 else None
-    except ValueError:return None
+def parse_value(message:Message,target:float)->tuple[float|None,str|None]:
+    try: v=float((message.text or '').replace(',','.'))
+    except ValueError:return None,'Введите число.'
+    if v<0:return None,'Результат не может быть отрицательным.'
+    safe_max=max(target*10,100000 if target<=0 else 0)
+    if v>safe_max:return None,f'Слишком большое значение. Максимум для ввода: {fmt(safe_max)}.'
+    return v,None
 
 def confirm_text(ch:Challenge,values:dict[int|str,float])->str:
-    exercises=db.get_exercises(ch.id); normalized={int(k):float(v) for k,v in values.items()}; points=0; lines=['<b>Проверка результата:</b>','']
+    exercises=db.get_exercises(ch.id); normalized={int(k):float(v) for k,v in values.items()}; lines=['<b>Проверка результата:</b>','']
     for e in exercises:
         v=normalized.get(e.id,0)
         lines.append(f'• {escape(e.name)}: <b>{fmt(v)}</b> {escape(e.unit)}')
@@ -192,68 +263,94 @@ def confirm_text(ch:Challenge,values:dict[int|str,float])->str:
 
 @router.message(ResultForm.collecting)
 async def collect_result(message:Message,state:FSMContext):
-    d=await state.get_data(); ch=db.get_challenge(d['challenge_id']); exercises=db.get_exercises(ch.id); idx=int(d['exercise_index']); ex=exercises[idx]; value=parse_value(message,ex.daily_target)
-    if value is None: await message.answer(f'Введите число от 0 до {fmt(ex.daily_target*10)}.'); return
+    if not message.from_user:return
+    d=await state.get_data(); ch=db.get_challenge(d.get('challenge_id'))
+    if not ch:
+        draft=db.get_result_draft(message.from_user.id)
+        if not draft:return await message.answer('Форма устарела. Нажмите «📝 Внести результат».')
+        ch=db.get_challenge(int(draft['challenge_id'])); d={'challenge_id':draft['challenge_id'],'result_date':draft['result_date'],'exercise_index':draft['exercise_index'],'values':draft['values']}
+    exercises=db.get_exercises(ch.id); idx=int(d.get('exercise_index',0))
+    if idx>=len(exercises):
+        await state.set_state(ResultForm.confirm); return await message.answer(confirm_text(ch,d.get('values',{})),reply_markup=confirm_keyboard())
+    ex=exercises[idx]; value,error=parse_value(message,ex.daily_target)
+    if error: await message.answer(error); return
     values={str(k):v for k,v in d.get('values',{}).items()}; values[str(ex.id)]=value; idx+=1
     if idx<len(exercises):
-        nxt=exercises[idx]; await state.update_data(values=values,exercise_index=idx); await message.answer(f'{escape(nxt.name)} — сколько {escape(nxt.unit)}? Норма: {fmt(nxt.daily_target)}')
+        nxt=exercises[idx]
+        await state.update_data(values=values,exercise_index=idx)
+        db.save_result_draft(message.from_user.id,ch.id,d['result_date'],idx,values,'collecting')
+        old=values.get(str(nxt.id)); suffix=f' Текущее значение: <b>{fmt(old)}</b>.' if old is not None else ''
+        await message.answer(f'{escape(nxt.name)} — сколько {escape(nxt.unit)}? Норма: {fmt(nxt.daily_target)}.{suffix}')
     else:
-        await state.update_data(values=values); await state.set_state(ResultForm.confirm); await message.answer(confirm_text(ch,values),reply_markup=confirm_keyboard())
+        await state.update_data(values=values,exercise_index=idx); await state.set_state(ResultForm.confirm)
+        db.save_result_draft(message.from_user.id,ch.id,d['result_date'],idx,values,'confirm')
+        await message.answer(confirm_text(ch,values),reply_markup=confirm_keyboard())
 
 @router.callback_query(F.data=='result:save')
 async def save(callback:CallbackQuery,state:FSMContext):
     d=await state.get_data()
-    required={'challenge_id','result_date','values'}
-    if not required.issubset(d):
-        await callback.answer('Форма устарела. Внесите результат заново.',show_alert=True)
-        return
+    if not {'challenge_id','result_date','values'}.issubset(d):
+        draft=db.get_result_draft(callback.from_user.id)
+        if draft:d={'challenge_id':draft['challenge_id'],'result_date':draft['result_date'],'values':draft['values']}
+        else:return await callback.answer('Форма устарела. Внесите результат заново.',show_alert=True)
     try:
-        values={int(k):float(v) for k,v in d['values'].items()}
-        ch=db.get_challenge(int(d['challenge_id']))
-        if not ch:
-            raise ValueError('Челлендж не найден')
+        values={int(k):float(v) for k,v in d['values'].items()}; ch=db.get_challenge(int(d['challenge_id']))
+        if not ch:raise ValueError('Челлендж не найден')
         db.upsert_user(callback.from_user.id,callback.from_user.full_name,callback.from_user.username)
         db.save_result(ch.id,callback.from_user.id,d['result_date'],values)
-
-        # Сначала подтверждаем успешную запись. Ошибка расчёта статистики ниже
-        # больше не создаст впечатление, что результат не сохранился.
         daily=db.calculate_daily_score(ch.id,values)
-        await state.clear()
-        await callback.answer('Сохранено')
+        db.delete_result_draft(callback.from_user.id); await state.clear(); await callback.answer('Сохранено')
         if callback.message:
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-
+            try:await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:pass
+        exercise_lines='\n'.join(f'• {escape(e.name)}: <b>{fmt(values.get(e.id,0))}</b> {escape(e.unit)}' for e in db.get_exercises(ch.id))
         try:
-            s=db.get_user_stats(ch.id,callback.from_user.id)
-            place,total=db.get_user_rank(ch.id,callback.from_user.id)
-            current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat())
-            text=(f'✅ <b>Результат сохранён</b>\n\n'
-                  f'За день: <b>{daily:.2f}</b>\n'
-                  f'Всего: <b>{float(s["points"]):.2f}</b>\n'
-                  f'Место: <b>{place or "—"} из {total}</b>\n'
-                  f'Серия: <b>{current}</b> · рекорд: <b>{longest}</b>')
+            s=db.get_user_stats(ch.id,callback.from_user.id); place,total=db.get_user_rank(ch.id,callback.from_user.id); current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat())
+            text=(f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n⭐ Всего: <b>{float(s["points"]):.2f}</b>\n🏆 Место: <b>{place or "—"} из {total}</b>\n🔥 Серия: <b>{current}</b> · рекорд: <b>{longest}</b>')
         except Exception:
-            logging.exception('Result saved, but statistics calculation failed')
-            text=f'✅ <b>Результат сохранён</b>\n\nЗа день: <b>{daily:.2f}</b>'
-        await callback.message.answer(text,reply_markup=main_keyboard())
+            logging.exception('Result saved, but statistics calculation failed'); text=f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>'
+        await callback.message.answer(text,reply_markup=saved_result_keyboard())
     except Exception as exc:
-        logging.exception('Unable to save result')
-        await callback.answer('Не удалось сохранить результат',show_alert=True)
-        if callback.message:
-            await callback.message.answer(
-                f'❌ Результат не сохранён. Ошибка: <code>{escape(str(exc))}</code>\n'
-                'Попробуйте внести результат ещё раз. Если ошибка повторится — пришлите эту строку из чата.'
-            )
+        logging.exception('Unable to save result'); await callback.answer('Не удалось сохранить результат',show_alert=True)
+        if callback.message:await callback.message.answer(f'❌ Результат не сохранён. Ошибка: <code>{escape(str(exc))}</code>\nПопробуйте внести результат ещё раз.')
 
 @router.callback_query(F.data=='result:edit')
 async def edit(callback:CallbackQuery,state:FSMContext):
-    d=await state.get_data(); ch=db.get_challenge(d['challenge_id']); ex=db.get_exercises(ch.id)[0]; await state.update_data(exercise_index=0,values={}); await state.set_state(ResultForm.collecting); await callback.answer(); await callback.message.answer(f'{escape(ex.name)} — сколько {escape(ex.unit)}?')
+    d=await state.get_data()
+    if not d:
+        draft=db.get_result_draft(callback.from_user.id); d=draft or {}
+    ch=db.get_challenge(int(d.get('challenge_id',0)))
+    if not ch:return await callback.answer('Форма устарела',show_alert=True)
+    existing=db.get_result(ch.id,callback.from_user.id,d.get('result_date',now().date().isoformat())) or {}
+    await callback.answer(); await begin_result_entry(callback.message,callback.from_user.id,ch,date.fromisoformat(d.get('result_date',now().date().isoformat())),state,existing)
+
+@router.callback_query(F.data=='saved:edit_today')
+async def edit_saved_today(callback:CallbackQuery,state:FSMContext):
+    g,ch=selected(callback.from_user.id)
+    if not ch:return await callback.answer('Нет активного челленджа',show_alert=True)
+    target=now().date(); existing=db.get_result(ch.id,callback.from_user.id,target.isoformat()) or {}
+    await callback.answer(); await begin_result_entry(callback.message,callback.from_user.id,ch,target,state,existing)
+
+@router.callback_query(F.data=='saved:rating')
+async def saved_rating(callback:CallbackQuery):
+    _,ch=selected(callback.from_user.id); await callback.answer()
+    if callback.message:await callback.message.answer(ranking_text(ch) if ch else 'Нет активного челленджа.',reply_markup=main_keyboard())
+
+@router.callback_query(F.data=='saved:stats')
+async def saved_stats(callback:CallbackQuery):
+    await callback.answer()
+    g,ch=selected(callback.from_user.id)
+    if not ch:
+        if callback.message:await callback.message.answer('В выбранной группе нет активного челленджа.')
+        return
+    s=db.get_user_stats(ch.id,callback.from_user.id); place,total=db.get_user_rank(ch.id,callback.from_user.id); current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat()); totals=db.get_user_totals(ch.id,callback.from_user.id); days=int(s['days']); avg=float(s['points'])/days if days else 0
+    lines=[f'<b>📊 {escape(g.title)}</b>',f'🏆 Место: <b>{place or "—"} из {total}</b>',f'⭐ Баллы: <b>{float(s["points"]):.2f}</b>',f'📅 Дней: <b>{days}</b>',f'🔥 Серия: <b>{current}</b> · рекорд: <b>{longest}</b>',f'📈 Среднее: <b>{avg:.2f}</b> балла/день','']
+    lines.extend(f'• {escape(r["name"])}: {fmt(float(r["total"]))} {escape(r["unit"])}' for r in totals)
+    if callback.message:await callback.message.answer('\n'.join(lines),reply_markup=main_keyboard())
 
 @router.callback_query(F.data=='result:cancel')
-async def cancel(callback:CallbackQuery,state:FSMContext): await state.clear(); await callback.answer(); await callback.message.answer('Отменено.',reply_markup=main_keyboard())
+async def cancel(callback:CallbackQuery,state:FSMContext):
+    db.delete_result_draft(callback.from_user.id); await state.clear(); await callback.answer(); await callback.message.answer('Отменено.',reply_markup=main_keyboard())
 
 @router.callback_query(F.data.startswith('public_rating:'))
 async def public_rating(callback:CallbackQuery):
