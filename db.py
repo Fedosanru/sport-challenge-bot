@@ -45,11 +45,14 @@ class Exercise:
 class Database:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
     def _cols(self, conn: sqlite3.Connection, table: str) -> set[str]:
@@ -266,11 +269,41 @@ class Database:
         return row['results_chat_id'] if row else None
 
     def save_result(self,challenge_id:int,user_id:int,result_date:str,values:dict[int,float])->None:
+        exercises = self.get_exercises(challenge_id)
+        if not exercises:
+            raise ValueError("У челленджа нет упражнений")
+        allowed_ids = {e.id for e in exercises}
+        unknown_ids = set(values) - allowed_ids
+        if unknown_ids:
+            raise ValueError(f"Неизвестные упражнения: {sorted(unknown_ids)}")
+
         with self._connect() as conn:
-            conn.execute("INSERT INTO results(challenge_id,user_id,result_date) VALUES(?,?,?) ON CONFLICT(challenge_id,user_id,result_date) DO UPDATE SET updated_at=CURRENT_TIMESTAMP",(challenge_id,user_id,result_date))
-            result_id=int(conn.execute("SELECT id FROM results WHERE challenge_id=? AND user_id=? AND result_date=?",(challenge_id,user_id,result_date)).fetchone()['id'])
-            for ex_id,value in values.items():
-                conn.execute("INSERT INTO result_values(result_id,exercise_id,value) VALUES(?,?,?) ON CONFLICT(result_id,exercise_id) DO UPDATE SET value=excluded.value",(result_id,ex_id,float(value)))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO results(challenge_id,user_id,result_date) VALUES(?,?,?) "
+                "ON CONFLICT(challenge_id,user_id,result_date) DO UPDATE SET updated_at=CURRENT_TIMESTAMP",
+                (challenge_id,user_id,result_date),
+            )
+            row = conn.execute(
+                "SELECT id FROM results WHERE challenge_id=? AND user_id=? AND result_date=?",
+                (challenge_id,user_id,result_date),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("Не удалось создать запись результата")
+            result_id = int(row["id"])
+
+            # Записываем полный набор упражнений, включая нули. Это исключает
+            # остаточные значения после повторного редактирования результата.
+            for exercise in exercises:
+                value = float(values.get(exercise.id, 0))
+                if value < 0:
+                    raise ValueError("Результат не может быть отрицательным")
+                conn.execute(
+                    "INSERT INTO result_values(result_id,exercise_id,value) VALUES(?,?,?) "
+                    "ON CONFLICT(result_id,exercise_id) DO UPDATE SET value=excluded.value",
+                    (result_id, exercise.id, value),
+                )
+            conn.commit()
 
     def get_result(self,challenge_id:int,user_id:int,result_date:str)->dict[int,float]|None:
         with self._connect() as conn:

@@ -68,7 +68,7 @@ def result_date_keyboard(edit_days:int,has_yesterday=False):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def confirm_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Сохранить',callback_data='save'),InlineKeyboardButton(text='✏️ Заново',callback_data='edit')],[InlineKeyboardButton(text='❌ Отмена',callback_data='cancel')]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Сохранить',callback_data='result:save'),InlineKeyboardButton(text='✏️ Заново',callback_data='result:edit')],[InlineKeyboardButton(text='❌ Отмена',callback_data='result:cancel')]])
 
 def fmt(v:float)->str: return str(int(v)) if float(v).is_integer() else f'{v:g}'
 
@@ -200,18 +200,59 @@ async def collect_result(message:Message,state:FSMContext):
     else:
         await state.update_data(values=values); await state.set_state(ResultForm.confirm); await message.answer(confirm_text(ch,values),reply_markup=confirm_keyboard())
 
-@router.callback_query(ResultForm.confirm,F.data=='save')
+@router.callback_query(F.data=='result:save')
 async def save(callback:CallbackQuery,state:FSMContext):
-    d=await state.get_data(); values={int(k):float(v) for k,v in d['values'].items()}; db.save_result(d['challenge_id'],callback.from_user.id,d['result_date'],values)
-    ch=db.get_challenge(d['challenge_id']); s=db.get_user_stats(ch.id,callback.from_user.id); place,total=db.get_user_rank(ch.id,callback.from_user.id); current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat())
-    daily=db.calculate_daily_score(ch.id,values)
-    await state.clear(); await callback.answer('Сохранено'); await callback.message.answer(f'✅ <b>Результат сохранён</b>\n\nЗа день: <b>{daily:.2f}</b>\nВсего: <b>{float(s["points"]):.2f}</b>\nМесто: <b>{place or "—"} из {total}</b>\nСерия: <b>{current}</b> · рекорд: <b>{longest}</b>',reply_markup=main_keyboard())
+    d=await state.get_data()
+    required={'challenge_id','result_date','values'}
+    if not required.issubset(d):
+        await callback.answer('Форма устарела. Внесите результат заново.',show_alert=True)
+        return
+    try:
+        values={int(k):float(v) for k,v in d['values'].items()}
+        ch=db.get_challenge(int(d['challenge_id']))
+        if not ch:
+            raise ValueError('Челлендж не найден')
+        db.upsert_user(callback.from_user.id,callback.from_user.full_name,callback.from_user.username)
+        db.save_result(ch.id,callback.from_user.id,d['result_date'],values)
 
-@router.callback_query(ResultForm.confirm,F.data=='edit')
+        # Сначала подтверждаем успешную запись. Ошибка расчёта статистики ниже
+        # больше не создаст впечатление, что результат не сохранился.
+        daily=db.calculate_daily_score(ch.id,values)
+        await state.clear()
+        await callback.answer('Сохранено')
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        try:
+            s=db.get_user_stats(ch.id,callback.from_user.id)
+            place,total=db.get_user_rank(ch.id,callback.from_user.id)
+            current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat())
+            text=(f'✅ <b>Результат сохранён</b>\n\n'
+                  f'За день: <b>{daily:.2f}</b>\n'
+                  f'Всего: <b>{float(s["points"]):.2f}</b>\n'
+                  f'Место: <b>{place or "—"} из {total}</b>\n'
+                  f'Серия: <b>{current}</b> · рекорд: <b>{longest}</b>')
+        except Exception:
+            logging.exception('Result saved, but statistics calculation failed')
+            text=f'✅ <b>Результат сохранён</b>\n\nЗа день: <b>{daily:.2f}</b>'
+        await callback.message.answer(text,reply_markup=main_keyboard())
+    except Exception as exc:
+        logging.exception('Unable to save result')
+        await callback.answer('Не удалось сохранить результат',show_alert=True)
+        if callback.message:
+            await callback.message.answer(
+                f'❌ Результат не сохранён. Ошибка: <code>{escape(str(exc))}</code>\n'
+                'Попробуйте внести результат ещё раз. Если ошибка повторится — пришлите эту строку из чата.'
+            )
+
+@router.callback_query(F.data=='result:edit')
 async def edit(callback:CallbackQuery,state:FSMContext):
     d=await state.get_data(); ch=db.get_challenge(d['challenge_id']); ex=db.get_exercises(ch.id)[0]; await state.update_data(exercise_index=0,values={}); await state.set_state(ResultForm.collecting); await callback.answer(); await callback.message.answer(f'{escape(ex.name)} — сколько {escape(ex.unit)}?')
 
-@router.callback_query(ResultForm.confirm,F.data=='cancel')
+@router.callback_query(F.data=='result:cancel')
 async def cancel(callback:CallbackQuery,state:FSMContext): await state.clear(); await callback.answer(); await callback.message.answer('Отменено.',reply_markup=main_keyboard())
 
 @router.callback_query(F.data.startswith('public_rating:'))
