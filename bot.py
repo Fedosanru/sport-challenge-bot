@@ -494,12 +494,12 @@ async def finish(message:Message,bot:Bot):
 @router.message(Command('id'))
 async def ids(message:Message): await message.answer(f'ID чата: <code>{message.chat.id}</code>')
 
-@router.message(F.chat.type.in_({ChatType.GROUP,ChatType.SUPERGROUP}))
-async def fallback(message:Message,bot:Bot):
-    text=(message.text or '').strip(); command=text.split('@',1)[0] if text.startswith('/') else text
-    if command in {'/start','/rating','/stats','/id','🏆 Общий рейтинг','📊 Статистика челленджа','📋 Правила'}:return
-    if text.startswith('/') or text:
-        me=await bot.get_me(); await message.answer('Эта функция доступна в личном чате.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Открыть личный чат',url=f'https://t.me/{me.username}')]]))
+# В группах бот обрабатывает только явно зарегистрированные команды и кнопки.
+# Обычные сообщения участников и неизвестные команды намеренно игнорируются,
+# чтобы бот не вмешивался в общение и не засорял чат.
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def ignore_group_messages(message: Message):
+    return
 
 async def main():
     logging.basicConfig(level=logging.INFO); db.init(); bot=Bot(BOT_TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(storage=MemoryStorage()); dp.include_router(router)
