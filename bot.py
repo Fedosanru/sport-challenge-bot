@@ -140,6 +140,8 @@ def saved_result_keyboard():
 def admin_challenge_keyboard(challenge_id:int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='🏆 Рейтинг',callback_data=f'admin_rating:{challenge_id}'), InlineKeyboardButton(text='📋 Правила',callback_data=f'admin_rules:{challenge_id}')],
+        [InlineKeyboardButton(text='📖 Журнал активности',callback_data=f'admin_log:{challenge_id}')],
+        [InlineKeyboardButton(text='👤 Добавить администратора',callback_data=f'admin_invite:{challenge_id}')],
         [InlineKeyboardButton(text='🔄 Обновить',callback_data=f'admin_active:{challenge_id}')],
         [InlineKeyboardButton(text='🏁 Завершить',callback_data=f'admin_finish:{challenge_id}')],
         [InlineKeyboardButton(text='⬅️ К списку',callback_data='admin_active_list')],
@@ -242,6 +244,13 @@ async def start(message:Message,state:FSMContext,bot:Bot):
     if not private(message):
         g=await ensure_group(message); await message.answer('Бот подключён к группе.',reply_markup=group_keyboard((await bot.get_me()).username,g.id)); return
     arg=(message.text or '').split(maxsplit=1)
+    if len(arg)>1 and arg[1].startswith('admin_'):
+        token=arg[1].split('_',1)[1]
+        invite=db.get_admin_invite(token)
+        if not invite:
+            await message.answer('Приглашение администратора не найдено или устарело.',reply_markup=main_keyboard()); return
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Принять роль администратора',callback_data=f'admin_accept:{token}')],[InlineKeyboardButton(text='❌ Отказаться',callback_data='admin_accept:cancel')]])
+        await message.answer(f'Вас приглашают стать администратором группы <b>«{escape(invite["group_title"]) }»</b>.\n\nВы получите доступ к управлению её челленджами в боте.',reply_markup=kb); return
     if len(arg)>1 and arg[1].startswith('result_'):
         try: gid=int(arg[1].split('_',1)[1]); db.add_member(gid,message.from_user.id); db.set_selected_group(message.from_user.id,gid)
         except ValueError: pass
@@ -535,6 +544,8 @@ async def save(callback:CallbackQuery,state:FSMContext):
         if not any(v>0 for v in additions.values()):
             raise ValueError('Добавьте хотя бы один результат больше нуля')
         db.save_result(ch.id,callback.from_user.id,d['result_date'],values)
+        added_text=', '.join(f'{e.name}: +{fmt(additions.get(e.id,0))} {e.unit}' for e in db.get_exercises(ch.id) if additions.get(e.id,0)>0)
+        db.log_activity(ch.group_id,ch.id,callback.from_user.id,'result_added',f'{d["result_date"]}; {added_text}')
         daily=db.calculate_daily_score(ch.id,values)
         is_personal_best=daily>previous_best+0.0001
         achievements=db.evaluate_achievements(ch.id,callback.from_user.id,d['result_date'],daily,is_personal_best)
@@ -728,6 +739,45 @@ async def admin_rules(callback:CallbackQuery):
     if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
     await callback.answer(); await callback.message.edit_text(rules_text(ch),reply_markup=admin_challenge_keyboard(ch.id))
 
+@router.callback_query(F.data.startswith('admin_log:'))
+async def admin_activity_log(callback:CallbackQuery):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    rows=db.get_activity_log(ch.group_id,ch.id,30)
+    labels={'result_added':'📝 Результат','challenge_created':'🚀 Создание','challenge_finished':'🏁 Завершение','admin_added':'👤 Новый администратор'}
+    lines=[f'<b>📖 Журнал активности</b>\n«{escape(ch.title)}»']
+    if not rows:lines.append('\nПока событий нет.')
+    for r in rows:
+        stamp=str(r['created_at'])[:16].replace('T',' ')
+        actor=escape(r['actor_name'] or 'Система')
+        detail=f' — {escape(r["details"])}' if r['details'] else ''
+        lines.append(f'\n{labels.get(r["action"],"•")} <b>{stamp}</b>\n{actor}{detail}')
+    await callback.answer(); await callback.message.edit_text('\n'.join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Назад',callback_data=f'admin_active:{ch.id}')]]))
+
+@router.callback_query(F.data.startswith('admin_invite:'))
+async def admin_invite(callback:CallbackQuery,bot:Bot):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    token=db.create_admin_invite(ch.group_id,ch.id,callback.from_user.id,24)
+    username=(await bot.get_me()).username
+    link=f'https://t.me/{username}?start=admin_{token}'
+    admins=db.get_group_admins(ch.group_id)
+    admin_names=', '.join(escape(r['full_name']) for r in admins) or 'нет'
+    text=f'<b>👤 Добавление администратора</b>\n\nОтправьте человеку эту одноразовую ссылку:\n<code>{link}</code>\n\nСсылка действует 24 часа и сработает один раз.\n\nТекущие администраторы: {admin_names}'
+    await callback.answer(); await callback.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Назад',callback_data=f'admin_active:{ch.id}')]]))
+
+@router.callback_query(F.data.startswith('admin_accept:'))
+async def admin_accept(callback:CallbackQuery):
+    token=callback.data.split(':',1)[1]
+    if token=='cancel':
+        await callback.answer(); await callback.message.edit_text('Приглашение отклонено.',reply_markup=main_keyboard()); return
+    db.upsert_user(callback.from_user.id,callback.from_user.full_name,callback.from_user.username)
+    ok,text,gid,cid=db.accept_admin_invite(token,callback.from_user.id)
+    if not ok:return await callback.answer(text,show_alert=True)
+    ch=db.get_challenge(int(cid)) if cid else None
+    db.log_activity(int(gid),int(cid) if cid else None,callback.from_user.id,'admin_added',callback.from_user.full_name)
+    await callback.answer('Готово'); await callback.message.edit_text('✅ Вы добавлены как администратор группы в боте.\n\nОткройте «🛠 Управление группой».',reply_markup=main_keyboard())
+
 @router.callback_query(F.data.startswith('admin_finish:'))
 async def admin_finish_prompt(callback:CallbackQuery):
     ch=db.get_challenge(int(callback.data.split(':')[1]))
@@ -739,7 +789,7 @@ async def admin_finish_confirm(callback:CallbackQuery,bot:Bot):
     ch=db.get_challenge(int(callback.data.split(':')[1]))
     if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
     if ch.status!='active':return await callback.answer('Челлендж уже завершён',show_alert=True)
-    g=db.get_group(ch.group_id); final=ranking_text(ch); db.finish_challenge(ch.id); text=f'🏁 Челлендж «{escape(ch.title)}» завершён.\n\n{final}'
+    g=db.get_group(ch.group_id); final=ranking_text(ch); db.finish_challenge(ch.id); db.log_activity(ch.group_id,ch.id,callback.from_user.id,'challenge_finished',ch.title); text=f'🏁 Челлендж «{escape(ch.title)}» завершён.\n\n{final}'
     await callback.answer('Челлендж завершён'); await callback.message.edit_text(text)
     if g:
         try: await bot.send_message(g.telegram_chat_id,text)
@@ -814,7 +864,9 @@ async def choose_rules(message:Message,state:FSMContext):
 
 async def finalize_challenge(message:Message,state:FSMContext,rules:dict):
     d=await state.get_data(); start=date.fromisoformat(d['start_date']); end=start+timedelta(days=int(d['duration'])-1); g=db.get_group(d['group_id'])
-    try: cid=db.create_challenge(g.id,d['title'],start.isoformat(),end.isoformat(),g.telegram_chat_id,d['exercises'],rules)
+    try:
+        cid=db.create_challenge(g.id,d['title'],start.isoformat(),end.isoformat(),g.telegram_chat_id,d['exercises'],rules)
+        db.log_activity(g.id,cid,message.from_user.id,'challenge_created',d['title'])
     except sqlite3.IntegrityError: return await message.answer('Активный челлендж уже существует.')
     await state.clear(); ch=db.get_challenge(cid); await message.answer('✅ Челлендж создан.\n\n'+rules_text(ch),reply_markup=main_keyboard())
 

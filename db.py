@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import secrets
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from pathlib import Path
 
 
@@ -159,6 +160,27 @@ class Database:
                 reminder_date TEXT NOT NULL,
                 sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(challenge_id,user_id,reminder_date)
+            );
+            CREATE TABLE IF NOT EXISTS activity_log(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                challenge_id INTEGER,
+                actor_user_id INTEGER,
+                action TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_log_group ON activity_log(group_id,id DESC);
+            CREATE INDEX IF NOT EXISTS idx_activity_log_challenge ON activity_log(challenge_id,id DESC);
+            CREATE TABLE IF NOT EXISTS admin_invites(
+                token TEXT PRIMARY KEY,
+                group_id INTEGER NOT NULL,
+                challenge_id INTEGER,
+                created_by INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_by INTEGER,
+                used_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             """)
             if "group_id" not in self._cols(conn, "challenges"):
@@ -675,3 +697,56 @@ class Database:
         with self._connect() as conn:
             row=conn.execute("SELECT reminders_enabled FROM users WHERE telegram_id=?",(user_id,)).fetchone(); value=0 if row and row['reminders_enabled'] else 1
             conn.execute("UPDATE users SET reminders_enabled=? WHERE telegram_id=?",(value,user_id)); return bool(value)
+
+
+    def log_activity(self,group_id:int,challenge_id:int|None,actor_user_id:int|None,action:str,details:str|None=None)->None:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO activity_log(group_id,challenge_id,actor_user_id,action,details) VALUES(?,?,?,?,?)",
+                         (group_id,challenge_id,actor_user_id,action,details))
+
+    def get_activity_log(self,group_id:int,challenge_id:int|None=None,limit:int=30):
+        with self._connect() as conn:
+            if challenge_id is None:
+                return conn.execute("""SELECT a.*,u.full_name actor_name FROM activity_log a
+                    LEFT JOIN users u ON u.telegram_id=a.actor_user_id
+                    WHERE a.group_id=? ORDER BY a.id DESC LIMIT ?""",(group_id,limit)).fetchall()
+            return conn.execute("""SELECT a.*,u.full_name actor_name FROM activity_log a
+                LEFT JOIN users u ON u.telegram_id=a.actor_user_id
+                WHERE a.group_id=? AND (a.challenge_id=? OR a.challenge_id IS NULL)
+                ORDER BY a.id DESC LIMIT ?""",(group_id,challenge_id,limit)).fetchall()
+
+    def create_admin_invite(self,group_id:int,challenge_id:int|None,created_by:int,hours:int=24)->str:
+        token=secrets.token_urlsafe(12)
+        expires=(datetime.now(timezone.utc)+timedelta(hours=hours)).isoformat()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM admin_invites WHERE expires_at < ? OR used_at IS NOT NULL",(datetime.now(timezone.utc).isoformat(),))
+            conn.execute("INSERT INTO admin_invites(token,group_id,challenge_id,created_by,expires_at) VALUES(?,?,?,?,?)",
+                         (token,group_id,challenge_id,created_by,expires))
+        return token
+
+    def get_admin_invite(self,token:str):
+        with self._connect() as conn:
+            return conn.execute("""SELECT i.*,g.title group_title,c.title challenge_title
+                FROM admin_invites i JOIN groups g ON g.id=i.group_id
+                LEFT JOIN challenges c ON c.id=i.challenge_id WHERE i.token=?""",(token,)).fetchone()
+
+    def accept_admin_invite(self,token:str,user_id:int)->tuple[bool,str,int|None,int|None]:
+        now_iso=datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row=conn.execute("SELECT * FROM admin_invites WHERE token=?",(token,)).fetchone()
+            if not row:return False,'Приглашение не найдено.',None,None
+            if row['used_at']:return False,'Приглашение уже использовано.',int(row['group_id']),row['challenge_id']
+            if row['expires_at'] < now_iso:return False,'Срок действия приглашения истёк.',int(row['group_id']),row['challenge_id']
+            conn.execute("""INSERT INTO group_members(group_id,user_id,role) VALUES(?,?,'admin')
+                ON CONFLICT(group_id,user_id) DO UPDATE SET role='admin'""",(row['group_id'],user_id))
+            conn.execute("UPDATE admin_invites SET used_by=?,used_at=? WHERE token=?",(user_id,now_iso,token))
+            conn.execute("INSERT INTO user_settings(user_id,selected_group_id) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET selected_group_id=excluded.selected_group_id",(user_id,row['group_id']))
+            conn.commit()
+            return True,'Администратор добавлен.',int(row['group_id']),row['challenge_id']
+
+    def get_group_admins(self,group_id:int):
+        with self._connect() as conn:
+            return conn.execute("""SELECT u.telegram_id,u.full_name,u.username,gm.joined_at
+                FROM group_members gm JOIN users u ON u.telegram_id=gm.user_id
+                WHERE gm.group_id=? AND gm.role='admin' ORDER BY u.full_name""",(group_id,)).fetchall()
