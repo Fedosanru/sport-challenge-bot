@@ -62,7 +62,7 @@ if not BOT_TOKEN: raise RuntimeError('BOT_TOKEN is not set')
 
 db=Database(DATABASE_PATH); router=Router()
 
-class ResultForm(StatesGroup): collecting=State(); confirm=State()
+class ResultForm(StatesGroup): selecting=State(); collecting=State(); confirm=State()
 class ChallengeForm(StatesGroup):
     title=State(); start_date=State(); duration=State(); exercise_name=State(); exercise_unit=State(); exercise_target=State(); exercise_points=State(); exercise_more=State(); rule_mode=State(); over_target=State(); success_mode=State(); min_points=State(); edit_days=State(); join_mode=State()
 class CloneForm(StatesGroup): choose=State(); title=State(); start_date=State(); duration=State()
@@ -110,6 +110,23 @@ def result_date_keyboard(edit_days:int,has_yesterday=False):
         if has_yesterday:
             rows.append([InlineKeyboardButton(text='⚡ Повторить вчера',callback_data='repeat:yesterday')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def exercise_selection_keyboard(exercises:list[Exercise],selected_ids:set[int]):
+    rows=[]
+    for e in exercises:
+        mark='✅' if e.id in selected_ids else '⬜'
+        rows.append([InlineKeyboardButton(text=f'{mark} {e.name}',callback_data=f'exercise_toggle:{e.id}')])
+    rows.append([InlineKeyboardButton(text='✅ Продолжить',callback_data='exercise_select:continue')])
+    rows.append([InlineKeyboardButton(text='❌ Отмена',callback_data='result:cancel')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def exercise_selection_text(selected_ids:set[int])->str:
+    hint='Выберите одно или несколько упражнений, которые хотите добавить.'
+    if selected_ids:
+        hint+=f'\n\nВыбрано: <b>{len(selected_ids)}</b>'
+    return f'<b>Что добавляем?</b>\n\n{hint}\nНули для остальных упражнений вводить не нужно.'
 
 def confirm_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Сохранить',callback_data='result:save'),InlineKeyboardButton(text='✏️ Заново',callback_data='result:edit')],[InlineKeyboardButton(text='❌ Отмена',callback_data='result:cancel')]])
@@ -308,17 +325,72 @@ async def begin_result_entry(target_message:Message,user_id:int,ch:Challenge,tar
     if not exercises:
         await target_message.answer('У челленджа нет упражнений.')
         return
-    # Повторное внесение результата является добавлением, а не заменой.
-    # Уже сохранённые значения храним отдельно, пользователь вводит только новую порцию.
+    # Уже сохранённые значения храним отдельно. Сначала пользователь выбирает
+    # только те упражнения, которые хочет дополнить сейчас.
     base_values={str(k):float(v) for k,v in (prefill or {}).items()}
     values={}
     await state.update_data(challenge_id=ch.id,result_date=target.isoformat(),exercise_index=0,values=values,base_values=base_values)
+    await state.set_state(ResultForm.selecting)
+    db.save_result_draft(user_id,ch.id,target.isoformat(),0,values,'selecting')
+    await target_message.answer(exercise_selection_text(set()),reply_markup=exercise_selection_keyboard(exercises,set()))
+
+@router.callback_query(F.data.startswith('exercise_toggle:'))
+async def toggle_exercise(callback:CallbackQuery,state:FSMContext):
+    d=await state.get_data()
+    ch=db.get_challenge(d.get('challenge_id'))
+    if not ch:
+        await callback.answer('Форма устарела. Начните заново.',show_alert=True)
+        return
+    try:
+        exercise_id=int(callback.data.split(':',1)[1])
+    except (ValueError,IndexError):
+        await callback.answer('Неизвестное упражнение',show_alert=True)
+        return
+    exercises=db.get_exercises(ch.id)
+    allowed={e.id for e in exercises}
+    if exercise_id not in allowed:
+        await callback.answer('Упражнение недоступно',show_alert=True)
+        return
+    values={str(k):float(v) for k,v in d.get('values',{}).items()}
+    key=str(exercise_id)
+    if key in values:
+        values.pop(key,None)
+    else:
+        values[key]=0.0
+    selected_ids={int(k) for k in values}
+    await state.update_data(values=values,exercise_index=0)
+    db.save_result_draft(callback.from_user.id,ch.id,d['result_date'],0,values,'selecting')
+    await callback.answer('Выбор обновлён')
+    if callback.message:
+        await callback.message.edit_text(exercise_selection_text(selected_ids),reply_markup=exercise_selection_keyboard(exercises,selected_ids))
+
+
+@router.callback_query(F.data=='exercise_select:continue')
+async def continue_selected_exercises(callback:CallbackQuery,state:FSMContext):
+    d=await state.get_data()
+    ch=db.get_challenge(d.get('challenge_id'))
+    if not ch:
+        await callback.answer('Форма устарела. Начните заново.',show_alert=True)
+        return
+    values={str(k):float(v) for k,v in d.get('values',{}).items()}
+    selected_ids={int(k) for k in values}
+    exercises=[e for e in db.get_exercises(ch.id) if e.id in selected_ids]
+    if not exercises:
+        await callback.answer('Выберите хотя бы одно упражнение',show_alert=True)
+        return
+    await state.update_data(exercise_index=0,values=values)
     await state.set_state(ResultForm.collecting)
-    db.save_result_draft(user_id,ch.id,target.isoformat(),0,values,'collecting')
+    db.save_result_draft(callback.from_user.id,ch.id,d['result_date'],0,values,'collecting')
     ex=exercises[0]
+    base_values={str(k):float(v) for k,v in d.get('base_values',{}).items()}
     already=base_values.get(str(ex.id),0)
     suffix=f' Уже за день: <b>{fmt(already)}</b> {escape(ex.unit)}.' if already>0 else ''
-    await target_message.answer(f'{escape(ex.name)} — сколько добавить сейчас? Норма: {fmt(ex.daily_target)}.{suffix}')
+    await callback.answer()
+    if callback.message:
+        try: await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception: pass
+        await callback.message.answer(f'{escape(ex.name)} — сколько добавить сейчас? Норма: {fmt(ex.daily_target)}.{suffix}')
+
 
 @router.callback_query(F.data.startswith('date:'))
 async def result_date(callback:CallbackQuery,state:FSMContext):
@@ -345,10 +417,15 @@ async def resume_draft(callback:CallbackQuery,state:FSMContext):
         db.delete_result_draft(callback.from_user.id); await callback.answer('Челлендж не найден',show_alert=True); return
     values={str(k):float(v) for k,v in draft.get('values',{}).items()}
     base_values={str(k):float(v) for k,v in (db.get_result(ch.id,callback.from_user.id,draft['result_date']) or {}).items()}
-    idx=int(draft.get('exercise_index',0)); exercises=db.get_exercises(ch.id)
+    idx=int(draft.get('exercise_index',0)); all_exercises=db.get_exercises(ch.id)
+    selected_ids={int(k) for k in values}
+    exercises=[e for e in all_exercises if e.id in selected_ids]
     await state.update_data(challenge_id=ch.id,result_date=draft['result_date'],exercise_index=idx,values=values,base_values=base_values)
     await callback.answer()
-    if draft.get('stage')=='confirm' or idx>=len(exercises):
+    if draft.get('stage')=='selecting':
+        await state.set_state(ResultForm.selecting)
+        await callback.message.answer(exercise_selection_text(selected_ids),reply_markup=exercise_selection_keyboard(all_exercises,selected_ids))
+    elif draft.get('stage')=='confirm' or idx>=len(exercises):
         await state.set_state(ResultForm.confirm)
         await callback.message.answer(confirm_text(ch,values,base_values),reply_markup=confirm_keyboard())
     else:
@@ -395,8 +472,9 @@ def confirm_text(ch:Challenge,values:dict[int|str,float],base_values:dict[int|st
     added={int(k):float(v) for k,v in values.items()}
     base={int(k):float(v) for k,v in (base_values or {}).items()}
     totals={e.id:base.get(e.id,0)+added.get(e.id,0) for e in exercises}
+    selected=[e for e in exercises if e.id in added]
     lines=['<b>Проверка добавления:</b>','']
-    for e in exercises:
+    for e in selected:
         before=base.get(e.id,0); plus=added.get(e.id,0); total=totals[e.id]
         if before>0:
             lines.append(f'• {escape(e.name)}: {fmt(before)} + <b>{fmt(plus)}</b> = <b>{fmt(total)}</b> {escape(e.unit)}')
@@ -414,12 +492,18 @@ async def collect_result(message:Message,state:FSMContext):
         draft=db.get_result_draft(message.from_user.id)
         if not draft:return await message.answer('Форма устарела. Нажмите «📝 Внести результат».')
         ch=db.get_challenge(int(draft['challenge_id'])); d={'challenge_id':draft['challenge_id'],'result_date':draft['result_date'],'exercise_index':draft['exercise_index'],'values':draft['values'],'base_values':{str(k):v for k,v in (db.get_result(int(draft['challenge_id']),message.from_user.id,draft['result_date']) or {}).items()}}
-    exercises=db.get_exercises(ch.id); idx=int(d.get('exercise_index',0))
+    values={str(k):float(v) for k,v in d.get('values',{}).items()}
+    selected_ids={int(k) for k in values}
+    exercises=[e for e in db.get_exercises(ch.id) if e.id in selected_ids]
+    idx=int(d.get('exercise_index',0))
+    if not exercises:
+        await state.set_state(ResultForm.selecting)
+        return await message.answer('Сначала выберите хотя бы одно упражнение.',reply_markup=exercise_selection_keyboard(db.get_exercises(ch.id),set()))
     if idx>=len(exercises):
-        await state.set_state(ResultForm.confirm); return await message.answer(confirm_text(ch,d.get('values',{}),d.get('base_values',{})),reply_markup=confirm_keyboard())
+        await state.set_state(ResultForm.confirm); return await message.answer(confirm_text(ch,values,d.get('base_values',{})),reply_markup=confirm_keyboard())
     ex=exercises[idx]; value,error=parse_value(message,ex.daily_target)
     if error: await message.answer(error); return
-    values={str(k):v for k,v in d.get('values',{}).items()}; values[str(ex.id)]=value; idx+=1
+    values[str(ex.id)]=value; idx+=1
     if idx<len(exercises):
         nxt=exercises[idx]
         await state.update_data(values=values,exercise_index=idx)
