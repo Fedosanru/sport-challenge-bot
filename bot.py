@@ -143,7 +143,7 @@ async def ensure_group(message:Message)->Group:
         db.add_member(g.id,message.from_user.id,role)
     return g
 
-def active_challenge_for_group(g:Group)->Challenge|None:
+def active_challenge_for_group(g:Group,user_id:int|None=None)->Challenge|None:
     ch=db.get_active_challenge(g.id)
     if ch:return ch
     # Compatibility with old databases where the challenge was linked only
@@ -151,8 +151,10 @@ def active_challenge_for_group(g:Group)->Challenge|None:
     ch=db.get_active_challenge_by_chat(g.telegram_chat_id)
     if ch and ch.group_id!=g.id:
         db.repair_challenge_group_link(ch.id,g.id,g.telegram_chat_id)
-        ch=db.get_challenge(ch.id)
-    return ch
+        return db.get_challenge(ch.id)
+    # A basic Telegram group receives a new chat id after conversion to a
+    # supergroup. Recover the season from the old row conservatively.
+    return db.recover_active_challenge_for_group(g.id,g.telegram_chat_id,g.title,user_id)
 
 def rules_text(ch:Challenge)->str:
     exercises=db.get_exercises(ch.id)
@@ -471,19 +473,19 @@ async def cancel(callback:CallbackQuery,state:FSMContext):
 
 @router.callback_query(F.data.startswith('public_rating:'))
 async def public_rating(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g) if g else None; me=await callback.bot.get_me()
+    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
     if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
     await callback.message.edit_text(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'rating')); await callback.answer()
 
 @router.callback_query(F.data.startswith('public_rules:'))
 async def public_rules(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g) if g else None; me=await callback.bot.get_me()
+    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
     if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
     await callback.message.edit_text(rules_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'rating')); await callback.answer()
 
 @router.callback_query(F.data.startswith('public_stats:'))
 async def public_stats(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g) if g else None; me=await callback.bot.get_me()
+    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
     if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
     await callback.message.edit_text(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'stats')); await callback.answer()
 
@@ -494,7 +496,7 @@ async def rating(message:Message):
         if not message.from_user:return
         _,ch=selected(message.from_user.id); await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard())
     else:
-        g=await ensure_group(message); ch=active_challenge_for_group(g); me=await message.bot.get_me(); await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id))
+        g=await ensure_group(message); ch=active_challenge_for_group(g,message.from_user.id if message.from_user else None); me=await message.bot.get_me(); await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id))
 
 @router.message(F.text=='📊 Статистика челленджа')
 @router.message(Command('stats'))
@@ -502,7 +504,7 @@ async def stats(message:Message):
     if private(message):
         _,ch=selected(message.from_user.id); await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard())
     else:
-        g=await ensure_group(message); ch=active_challenge_for_group(g); me=await message.bot.get_me(); await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'stats'))
+        g=await ensure_group(message); ch=active_challenge_for_group(g,message.from_user.id if message.from_user else None); me=await message.bot.get_me(); await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'stats'))
 
 @router.message(F.text=='📊 Моя статистика')
 async def my_stats(message:Message):

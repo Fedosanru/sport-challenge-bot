@@ -94,7 +94,7 @@ Telegram-бот для нескольких групп с универсальн
 - При нескольких активных челленджах бот предлагает выбрать нужный.
 - Выбор защищён проверкой участия пользователя в группе.
 
-## v11.8
+## v11.9
 
 - Coach Mode: private reminders at 22:00 in the timezone from `TIMEZONE` (default `Europe/Moscow`).
 - Reminders are sent only to users who have reminders enabled and have not submitted a result for the current day.
@@ -103,3 +103,8 @@ Telegram-бот для нескольких групп с универсальн
 - Each user receives at most one reminder per challenge per day (`reminder_log`).
 - Fixed active challenge lookup in group chats, including compatibility with legacy databases where a challenge was linked by `results_chat_id` or another group record.
 - No database or Railway Volume reset is required.
+
+
+## v11.9 — восстановление активного челленджа в группе
+
+Исправлена ситуация, когда Telegram меняет `chat_id` после преобразования обычной группы в супергруппу. Бот теперь безопасно находит активный челлендж по прежней записи группы, переносит его на актуальный `chat_id`, переносит участников и обновляет выбранную группу. Базу данных удалять не нужно.
