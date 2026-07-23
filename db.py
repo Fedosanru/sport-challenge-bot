@@ -253,6 +253,25 @@ class Database:
     def get_challenges(self,group_id:int,limit:int=10):
         with self._connect() as conn: return conn.execute("SELECT id,title,start_date,end_date,status FROM challenges WHERE group_id=? ORDER BY id DESC LIMIT ?",(group_id,limit)).fetchall()
 
+    def get_admin_active_challenges(self,user_id:int,all_groups:bool=False):
+        with self._connect() as conn:
+            if all_groups:
+                return conn.execute("""SELECT c.id,c.group_id,c.title,c.start_date,c.end_date,c.status,g.title group_title
+                    FROM challenges c JOIN groups g ON g.id=c.group_id
+                    WHERE c.status='active' ORDER BY c.end_date,c.id""").fetchall()
+            return conn.execute("""SELECT c.id,c.group_id,c.title,c.start_date,c.end_date,c.status,g.title group_title
+                FROM challenges c JOIN groups g ON g.id=c.group_id
+                JOIN group_members gm ON gm.group_id=c.group_id AND gm.user_id=? AND gm.role='admin'
+                WHERE c.status='active' ORDER BY c.end_date,c.id""",(user_id,)).fetchall()
+
+    def get_finished_challenges(self,group_id:int,limit:int=20):
+        with self._connect() as conn:
+            return conn.execute("""SELECT c.id,c.title,c.start_date,c.end_date,c.status,COUNT(DISTINCT r.user_id) members
+                FROM challenges c LEFT JOIN results r ON r.challenge_id=c.id
+                WHERE c.group_id=? AND c.status='finished'
+                GROUP BY c.id,c.title,c.start_date,c.end_date,c.status
+                ORDER BY c.id DESC LIMIT ?""",(group_id,limit)).fetchall()
+
     def get_exercises(self,challenge_id:int)->list[Exercise]:
         with self._connect() as conn: rows=conn.execute("SELECT id,challenge_id,name,unit,daily_target,max_points,sort_order FROM challenge_exercises WHERE challenge_id=? ORDER BY sort_order,id",(challenge_id,)).fetchall()
         return [Exercise(**dict(r)) for r in rows]

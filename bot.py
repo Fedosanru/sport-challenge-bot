@@ -46,6 +46,7 @@ def main_keyboard():
 
 def manage_keyboard():
     return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text='🟢 Активные челленджи')],
         [KeyboardButton(text='➕ Новый челлендж'),KeyboardButton(text='📋 Копировать челлендж')],
         [KeyboardButton(text='🗂 Архив челленджей'),KeyboardButton(text='🏁 Завершить челлендж')],
         [KeyboardButton(text='⬅️ Главное меню')]],resize_keyboard=True)
@@ -75,6 +76,20 @@ def resume_keyboard():
 
 def saved_result_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✏️ Изменить результат',callback_data='saved:edit_today')],[InlineKeyboardButton(text='🏆 Рейтинг',callback_data='saved:rating'),InlineKeyboardButton(text='📊 Моя статистика',callback_data='saved:stats')]])
+
+def admin_challenge_keyboard(challenge_id:int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🏆 Рейтинг',callback_data=f'admin_rating:{challenge_id}'), InlineKeyboardButton(text='📋 Правила',callback_data=f'admin_rules:{challenge_id}')],
+        [InlineKeyboardButton(text='🔄 Обновить',callback_data=f'admin_active:{challenge_id}')],
+        [InlineKeyboardButton(text='🏁 Завершить',callback_data=f'admin_finish:{challenge_id}')],
+        [InlineKeyboardButton(text='⬅️ К списку',callback_data='admin_active_list')],
+    ])
+
+def finish_confirm_keyboard(challenge_id:int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✅ Да, завершить',callback_data=f'admin_finish_confirm:{challenge_id}')],
+        [InlineKeyboardButton(text='❌ Отмена',callback_data=f'admin_active:{challenge_id}')],
+    ])
 
 def fmt(v:float)->str: return str(int(v)) if float(v).is_integer() else f'{v:g}'
 
@@ -125,6 +140,21 @@ def group_stats_text(ch:Challenge)->str:
     if rows: lines.append(f'🏆 Лидер: <b>{escape(rows[0]["full_name"])}</b>')
     lines.append('\n<b>Итоги по упражнениям:</b>')
     lines.extend(f'• {escape(r["name"])}: {fmt(float(r["total"]))} {escape(r["unit"])}' for r in totals)
+    return '\n'.join(lines)
+
+def admin_active_text(ch:Challenge)->str:
+    g=db.get_group(ch.group_id)
+    today=now().date(); start=date.fromisoformat(ch.start_date); end=date.fromisoformat(ch.end_date)
+    stats=db.get_group_stats(ch.id,today.isoformat()); ranking=db.get_ranking(ch.id)
+    if today < start: phase=f'Старт через {(start-today).days} дн.'
+    elif today > end: phase=f'Срок завершён {(today-end).days} дн. назад'
+    else: phase=f'День {(today-start).days+1} из {(end-start).days+1}'
+    lines=[f'<b>🟢 {escape(ch.title)}</b>',f'Группа: <b>{escape(g.title if g else "Неизвестная группа")}</b>',f'📅 {start:%d.%m.%Y} — {end:%d.%m.%Y}',f'⏱ {phase}','',f'👥 Участников: <b>{stats["members"]}</b>',f'✅ Отметились сегодня: <b>{stats["active_today"]}</b>',f'📝 Дней с результатами: <b>{stats["result_days"]}</b>',f'⭐ Начислено баллов: <b>{float(stats["points"]):.2f}</b>']
+    if ranking: lines.append(f'🏆 Лидер: <b>{escape(ranking[0]["full_name"])}</b> — {float(ranking[0]["points"]):.2f}')
+    exercises=db.get_exercises(ch.id)
+    if exercises:
+        lines.append('\n<b>Упражнения:</b>')
+        lines.extend(f'• {escape(e.name)} — {fmt(e.daily_target)} {escape(e.unit)}' for e in exercises)
     return '\n'.join(lines)
 
 @router.message(CommandStart())
@@ -416,6 +446,61 @@ async def manage(message:Message):
 @router.message(F.text=='⬅️ Главное меню')
 async def home(message:Message,state:FSMContext): await state.clear(); await message.answer('Главное меню.',reply_markup=main_keyboard())
 
+@router.message(F.text=='🟢 Активные челленджи')
+async def active_challenges(message:Message):
+    if not private(message) or not message.from_user:return
+    rows=db.get_admin_active_challenges(message.from_user.id,message.from_user.id in ADMIN_IDS)
+    if not rows:return await message.answer('У вас нет активных челленджей.')
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f'🟢 {r["group_title"]}: {r["title"]}',callback_data=f'admin_active:{r["id"]}')] for r in rows])
+    await message.answer(f'<b>🟢 Активные челленджи</b>\n\nВсего: <b>{len(rows)}</b>',reply_markup=kb)
+
+@router.callback_query(F.data=='admin_active_list')
+async def active_challenges_callback(callback:CallbackQuery):
+    rows=db.get_admin_active_challenges(callback.from_user.id,callback.from_user.id in ADMIN_IDS)
+    if not rows:return await callback.answer('Активных челленджей нет',show_alert=True)
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f'🟢 {r["group_title"]}: {r["title"]}',callback_data=f'admin_active:{r["id"]}')] for r in rows])
+    await callback.answer(); await callback.message.edit_text(f'<b>🟢 Активные челленджи</b>\n\nВсего: <b>{len(rows)}</b>',reply_markup=kb)
+
+async def can_manage_challenge(user_id:int,ch:Challenge|None)->bool:
+    return bool(ch and (user_id in ADMIN_IDS or db.is_group_admin(ch.group_id,user_id)))
+
+@router.callback_query(F.data.startswith('admin_active:'))
+async def active_challenge_card(callback:CallbackQuery):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    if ch.status!='active':return await callback.answer('Челлендж уже завершён',show_alert=True)
+    await callback.answer(); await callback.message.edit_text(admin_active_text(ch),reply_markup=admin_challenge_keyboard(ch.id))
+
+@router.callback_query(F.data.startswith('admin_rating:'))
+async def admin_rating(callback:CallbackQuery):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    await callback.answer(); await callback.message.edit_text(ranking_text(ch),reply_markup=admin_challenge_keyboard(ch.id))
+
+@router.callback_query(F.data.startswith('admin_rules:'))
+async def admin_rules(callback:CallbackQuery):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    await callback.answer(); await callback.message.edit_text(rules_text(ch),reply_markup=admin_challenge_keyboard(ch.id))
+
+@router.callback_query(F.data.startswith('admin_finish:'))
+async def admin_finish_prompt(callback:CallbackQuery):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    await callback.answer(); await callback.message.edit_text(f'Завершить челлендж <b>«{escape(ch.title)}»</b>?\n\nПосле завершения новые результаты внести будет нельзя.',reply_markup=finish_confirm_keyboard(ch.id))
+
+@router.callback_query(F.data.startswith('admin_finish_confirm:'))
+async def admin_finish_confirm(callback:CallbackQuery,bot:Bot):
+    ch=db.get_challenge(int(callback.data.split(':')[1]))
+    if not await can_manage_challenge(callback.from_user.id,ch):return await callback.answer('Недостаточно прав',show_alert=True)
+    if ch.status!='active':return await callback.answer('Челлендж уже завершён',show_alert=True)
+    g=db.get_group(ch.group_id); final=ranking_text(ch); db.finish_challenge(ch.id); text=f'🏁 Челлендж «{escape(ch.title)}» завершён.\n\n{final}'
+    await callback.answer('Челлендж завершён'); await callback.message.edit_text(text)
+    if g:
+        try: await bot.send_message(g.telegram_chat_id,text)
+        except Exception: logging.exception('Не удалось отправить итог в группу %s',g.telegram_chat_id)
+
+
 @router.message(F.text=='➕ Новый челлендж')
 async def new_challenge(message:Message,state:FSMContext):
     g=db.get_selected_group(message.from_user.id)
@@ -545,10 +630,15 @@ async def custom_join(callback:CallbackQuery,state:FSMContext):
 
 @router.message(F.text=='🗂 Архив челленджей')
 async def archive(message:Message):
-    g=db.get_selected_group(message.from_user.id); rows=db.get_challenges(g.id) if g else []
+    if not private(message) or not message.from_user:return
+    g=db.get_selected_group(message.from_user.id)
+    if not g:return await message.answer('Сначала выберите группу.')
+    if not (db.is_group_admin(g.id,message.from_user.id) or message.from_user.id in ADMIN_IDS):return await message.answer('Недостаточно прав.')
+    rows=db.get_finished_challenges(g.id,20)
     if not rows:return await message.answer('Архив пока пуст.')
-    lines=['<b>🗂 Челленджи группы</b>','']
-    for r in rows: lines.append(f'• {"🟢" if r["status"]=="active" else "⚪️"} <b>{escape(r["title"])}</b>\n  {date.fromisoformat(r["start_date"]):%d.%m.%Y} — {date.fromisoformat(r["end_date"]):%d.%m.%Y}')
+    lines=[f'<b>🗂 Архив группы «{escape(g.title)}»</b>','']
+    for r in rows:
+        lines.append(f'• <b>{escape(r["title"])}</b>\n  {date.fromisoformat(r["start_date"]):%d.%m.%Y} — {date.fromisoformat(r["end_date"]):%d.%m.%Y} · участников: {r["members"]}')
     await message.answer('\n'.join(lines))
 
 @router.message(F.text=='📋 Копировать челлендж')
@@ -582,11 +672,12 @@ async def clone_duration(message:Message,state:FSMContext):
     cid=db.clone_challenge(d['source_id'],g.id,d['title'],start.isoformat(),end.isoformat(),g.telegram_chat_id); await state.clear(); await message.answer('✅ Копия создана.\n\n'+rules_text(db.get_challenge(cid)),reply_markup=main_keyboard())
 
 @router.message(F.text=='🏁 Завершить челлендж')
-async def finish(message:Message,bot:Bot):
+async def finish(message:Message):
+    if not private(message) or not message.from_user:return
     g,ch=selected(message.from_user.id)
     if not g or not ch:return await message.answer('Нет активного челленджа.')
-    if not (db.is_group_admin(g.id,message.from_user.id) or message.from_user.id in ADMIN_IDS):return
-    final=ranking_text(ch); db.finish_challenge(ch.id); text=f'🏁 Челлендж «{escape(ch.title)}» завершён.\n\n{final}'; await message.answer(text,reply_markup=main_keyboard()); await bot.send_message(g.telegram_chat_id,text)
+    if not (db.is_group_admin(g.id,message.from_user.id) or message.from_user.id in ADMIN_IDS):return await message.answer('Недостаточно прав.')
+    await message.answer(f'Завершить челлендж <b>«{escape(ch.title)}»</b>?\n\nПосле завершения новые результаты внести будет нельзя.',reply_markup=finish_confirm_keyboard(ch.id))
 
 @router.message(Command('id'))
 async def ids(message:Message): await message.answer(f'ID чата: <code>{message.chat.id}</code>')
