@@ -60,6 +60,14 @@ def group_keyboard(bot_username:str,group_id:int,view='rating'):
 def group_choice(rows,prefix='group'):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=('✅ ' if r['has_active'] else '')+r['title'],callback_data=f'{prefix}:{r["id"]}')] for r in rows])
 
+def result_challenge_choice(rows):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f'🏠 {r["group_title"]} · {r["challenge_title"]}',
+            callback_data=f'result_group:{r["group_id"]}',
+        )
+    ] for r in rows])
+
 def result_date_keyboard(edit_days:int,has_yesterday=False):
     today=now().date(); rows=[]
     for offset in range(0,edit_days+1):
@@ -184,13 +192,14 @@ async def set_group(callback:CallbackQuery):
     gid=int(callback.data.split(':')[1]); db.set_selected_group(callback.from_user.id,gid); g=db.get_group(gid)
     await callback.answer('Группа выбрана'); await callback.message.answer(f'Выбрана группа: <b>{escape(g.title)}</b>',reply_markup=main_keyboard())
 
-@router.message(F.text=='📝 Внести результат')
-async def result_start(message:Message,state:FSMContext):
-    if not private(message) or not message.from_user:return
-    g,ch=selected(message.from_user.id)
-    if not ch: await message.answer('В выбранной группе нет активного челленджа.'); return
+async def open_result_for_challenge(message:Message,state:FSMContext,ch:Challenge):
     today=now().date()
-    if not (date.fromisoformat(ch.start_date)<=today<=date.fromisoformat(ch.end_date)): await message.answer('Сегодня вне дат активного челленджа.'); return
+    if today < date.fromisoformat(ch.start_date):
+        await message.answer(f'Челлендж начнётся <b>{date.fromisoformat(ch.start_date):%d.%m.%Y}</b>.')
+        return
+    if today > date.fromisoformat(ch.end_date):
+        await message.answer('Срок этого челленджа уже завершён.')
+        return
 
     draft=db.get_result_draft(message.from_user.id)
     if draft and int(draft['challenge_id'])==ch.id:
@@ -202,9 +211,45 @@ async def result_start(message:Message,state:FSMContext):
     if draft:
         db.delete_result_draft(message.from_user.id)
 
-    yesterday=(today-timedelta(days=1)).isoformat(); has=bool(db.get_result(ch.id,message.from_user.id,yesterday))
+    yesterday=(today-timedelta(days=1)).isoformat()
+    has=bool(db.get_result(ch.id,message.from_user.id,yesterday))
     await state.update_data(challenge_id=ch.id)
     await message.answer('За какой день внести результат?',reply_markup=result_date_keyboard(ch.edit_days,has))
+
+@router.message(F.text=='📝 Внести результат')
+async def result_start(message:Message,state:FSMContext):
+    if not private(message) or not message.from_user:return
+    user_id=message.from_user.id
+    g,ch=selected(user_id)
+
+    # The selected group can be stale or can have no active season. In that
+    # case search all groups in which the user participates.
+    if not ch:
+        rows=db.get_user_active_challenges(user_id)
+        if not rows:
+            await message.answer('У вас нет доступных активных челленджей. Откройте сообщение бота в группе и нажмите «📝 Внести результат».')
+            return
+        if len(rows)>1:
+            await message.answer('Выберите челлендж, в который хотите внести результат:',reply_markup=result_challenge_choice(rows))
+            return
+        db.set_selected_group(user_id,int(rows[0]['group_id']))
+        ch=db.get_challenge(int(rows[0]['challenge_id']))
+
+    await open_result_for_challenge(message,state,ch)
+
+@router.callback_query(F.data.startswith('result_group:'))
+async def select_result_group(callback:CallbackQuery,state:FSMContext):
+    gid=int(callback.data.split(':',1)[1])
+    rows=db.get_user_active_challenges(callback.from_user.id)
+    allowed={int(r['group_id']):int(r['challenge_id']) for r in rows}
+    challenge_id=allowed.get(gid)
+    if not challenge_id:
+        await callback.answer('Челлендж больше недоступен',show_alert=True)
+        return
+    db.set_selected_group(callback.from_user.id,gid)
+    ch=db.get_challenge(challenge_id)
+    await callback.answer('Челлендж выбран')
+    await open_result_for_challenge(callback.message,state,ch)
 
 async def begin_result_entry(target_message:Message,user_id:int,ch:Challenge,target:date,state:FSMContext,prefill:dict[int,float]|None=None):
     exercises=db.get_exercises(ch.id)

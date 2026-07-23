@@ -235,6 +235,19 @@ class Database:
             JOIN group_members gm ON gm.group_id=g.id AND gm.user_id=s.user_id WHERE s.user_id=?""",(user_id,)).fetchone()
         return Group(**dict(row)) if row else None
 
+    def get_user_active_challenges(self,user_id:int):
+        """Return active challenges from every group the user belongs to."""
+        with self._connect() as conn:
+            return conn.execute("""
+                SELECT c.id challenge_id,c.group_id,c.title challenge_title,c.start_date,c.end_date,
+                       g.title group_title
+                FROM group_members gm
+                JOIN groups g ON g.id=gm.group_id
+                JOIN challenges c ON c.group_id=g.id AND c.status='active'
+                WHERE gm.user_id=?
+                ORDER BY c.start_date,c.id
+            """,(user_id,)).fetchall()
+
     def is_group_admin(self,group_id:int,user_id:int)->bool:
         with self._connect() as conn: row=conn.execute("SELECT role FROM group_members WHERE group_id=? AND user_id=?",(group_id,user_id)).fetchone()
         return bool(row and row["role"]=="admin")
