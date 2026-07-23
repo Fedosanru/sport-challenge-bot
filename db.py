@@ -519,6 +519,39 @@ class Database:
             repaired=conn.execute("SELECT id,group_id,title,start_date,end_date,status,results_chat_id,scoring_mode,over_target_mode,success_mode,min_daily_points,edit_days,join_mode,rules_locked FROM challenges WHERE id=?",(int(row['id']),)).fetchone()
         return self._challenge_from_row(repaired)
 
+
+    def recover_unique_user_active_challenge(self, group_id:int, chat_id:int, user_id:int)->Challenge|None:
+        """Bind the user's only active challenge to the current Telegram group.
+
+        This is a final conservative recovery path for renamed groups and old
+        inline keyboards after Telegram migration. It acts only when the user
+        belongs to exactly one active challenge outside the current group.
+        """
+        with self._connect() as conn:
+            rows=conn.execute("""
+                SELECT c.id,c.group_id,c.title,c.start_date,c.end_date,c.status,c.results_chat_id,
+                       c.scoring_mode,c.over_target_mode,c.success_mode,c.min_daily_points,
+                       c.edit_days,c.join_mode,c.rules_locked
+                FROM challenges c
+                JOIN group_members gm ON gm.group_id=c.group_id AND gm.user_id=?
+                WHERE c.status='active' AND c.group_id<>?
+                ORDER BY c.id DESC
+            """,(user_id,group_id)).fetchall()
+            if len(rows)!=1:
+                return None
+            row=rows[0]
+            old_group_id=int(row['group_id'])
+            conn.execute("""
+                INSERT INTO group_members(group_id,user_id,role,joined_at)
+                SELECT ?,user_id,role,joined_at FROM group_members WHERE group_id=?
+                ON CONFLICT(group_id,user_id) DO UPDATE SET role=
+                    CASE WHEN group_members.role='admin' OR excluded.role='admin' THEN 'admin' ELSE 'member' END
+            """,(group_id,old_group_id))
+            conn.execute("UPDATE user_settings SET selected_group_id=? WHERE selected_group_id=?",(group_id,old_group_id))
+            conn.execute("UPDATE challenges SET group_id=?,results_chat_id=? WHERE id=?",(group_id,chat_id,int(row['id'])))
+            repaired=conn.execute("SELECT id,group_id,title,start_date,end_date,status,results_chat_id,scoring_mode,over_target_mode,success_mode,min_daily_points,edit_days,join_mode,rules_locked FROM challenges WHERE id=?",(int(row['id']),)).fetchone()
+        return self._challenge_from_row(repaired)
+
     def get_active_challenge_by_chat(self,chat_id:int)->Challenge|None:
         """Find the active season for a Telegram group, including legacy rows."""
         with self._connect() as conn:

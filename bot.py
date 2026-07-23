@@ -154,7 +154,11 @@ def active_challenge_for_group(g:Group,user_id:int|None=None)->Challenge|None:
         return db.get_challenge(ch.id)
     # A basic Telegram group receives a new chat id after conversion to a
     # supergroup. Recover the season from the old row conservatively.
-    return db.recover_active_challenge_for_group(g.id,g.telegram_chat_id,g.title,user_id)
+    ch=db.recover_active_challenge_for_group(g.id,g.telegram_chat_id,g.title,user_id)
+    if ch:return ch
+    # Final recovery for renamed/migrated groups: only when this user has one
+    # unambiguous active challenge elsewhere.
+    return db.recover_unique_user_active_challenge(g.id,g.telegram_chat_id,user_id) if user_id is not None else None
 
 def rules_text(ch:Challenge)->str:
     exercises=db.get_exercises(ch.id)
@@ -471,23 +475,36 @@ async def saved_stats(callback:CallbackQuery):
 async def cancel(callback:CallbackQuery,state:FSMContext):
     db.delete_result_draft(callback.from_user.id); await state.clear(); await callback.answer(); await callback.message.answer('Отменено.',reply_markup=main_keyboard())
 
+async def callback_current_group(callback:CallbackQuery)->Group|None:
+    if not callback.message or callback.message.chat.type not in {'group','supergroup'}:
+        return None
+    g=db.upsert_group(callback.message.chat.id,callback.message.chat.title or 'Группа')
+    db.upsert_user(callback.from_user.id,callback.from_user.full_name,callback.from_user.username)
+    try:
+        member=await callback.bot.get_chat_member(callback.message.chat.id,callback.from_user.id)
+        role='admin' if member.status in {'administrator','creator'} else 'member'
+    except Exception:
+        role='member'
+    db.add_member(g.id,callback.from_user.id,role)
+    return g
+
 @router.callback_query(F.data.startswith('public_rating:'))
 async def public_rating(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
-    if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
-    await callback.message.edit_text(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'rating')); await callback.answer()
+    g=await callback_current_group(callback); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
+    if not g or not callback.message:return await callback.answer('Группа не найдена',show_alert=True)
+    await callback.message.edit_text(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'rating')); await callback.answer()
 
 @router.callback_query(F.data.startswith('public_rules:'))
 async def public_rules(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
-    if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
-    await callback.message.edit_text(rules_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'rating')); await callback.answer()
+    g=await callback_current_group(callback); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
+    if not g or not callback.message:return await callback.answer('Группа не найдена',show_alert=True)
+    await callback.message.edit_text(rules_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'rating')); await callback.answer()
 
 @router.callback_query(F.data.startswith('public_stats:'))
 async def public_stats(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
-    if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
-    await callback.message.edit_text(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'stats')); await callback.answer()
+    g=await callback_current_group(callback); ch=active_challenge_for_group(g,callback.from_user.id) if g else None; me=await callback.bot.get_me()
+    if not g or not callback.message:return await callback.answer('Группа не найдена',show_alert=True)
+    await callback.message.edit_text(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'stats')); await callback.answer()
 
 @router.message(F.text=='🏆 Общий рейтинг')
 @router.message(Command('rating'))
