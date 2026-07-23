@@ -607,6 +607,70 @@ class Database:
             conn.execute("INSERT OR IGNORE INTO reminder_log(challenge_id,user_id,reminder_date) VALUES(?,?,?)",
                          (challenge_id,user_id,reminder_date))
 
+
+    def get_daily_score(self, challenge_id:int, user_id:int, result_date:str)->float|None:
+        values=self.get_result(challenge_id,user_id,result_date)
+        return self.calculate_daily_score(challenge_id,values) if values is not None else None
+
+    def get_personal_best_before(self, challenge_id:int, user_id:int, before_date:str)->tuple[float,str|None]:
+        best=-1.0; best_date=None
+        for result_date in self.get_user_result_dates(challenge_id,user_id):
+            if result_date>=before_date:
+                continue
+            score=self.get_daily_score(challenge_id,user_id,result_date)
+            if score is not None and score>best:
+                best=float(score); best_date=result_date
+        return (max(best,0.0),best_date)
+
+    def award_achievement(self, challenge_id:int, user_id:int, key:str, title:str, description:str)->bool:
+        with self._connect() as conn:
+            cur=conn.execute("INSERT OR IGNORE INTO achievements(challenge_id,user_id,achievement_key,title,description) VALUES(?,?,?,?,?)",
+                             (challenge_id,user_id,key,title,description))
+            return cur.rowcount>0
+
+    def evaluate_achievements(self, challenge_id:int, user_id:int, through_date:str, daily_score:float, is_personal_best:bool)->list[tuple[str,str]]:
+        current,longest=self.calculate_streaks(challenge_id,user_id,through_date)
+        earned=[]
+        milestones={3:('🔥 Три дня без оправданий','3 дня подряд с результатом.'),7:('⚡ Неделя без оправданий','7 дней подряд с результатом.'),14:('🦾 Железная воля','14 дней подряд с результатом.')}
+        for days,(title,description) in milestones.items():
+            if current>=days and self.award_achievement(challenge_id,user_id,f'streak_{days}',title,description):
+                earned.append((title,description))
+        if is_personal_best and daily_score>0 and self.award_achievement(challenge_id,user_id,'first_personal_best','🚀 Личный рекорд','Установлен новый лучший результат за день.'):
+            earned.append(('🚀 Личный рекорд','Установлен новый лучший результат за день.'))
+        return earned
+
+    def get_daily_summary(self, challenge_id:int, summary_date:str):
+        ch=self.get_challenge(challenge_id)
+        if not ch:return None
+        with self._connect() as conn:
+            members=int(conn.execute("SELECT COUNT(*) n FROM group_members WHERE group_id=?",(ch.group_id,)).fetchone()['n'])
+            active=int(conn.execute("SELECT COUNT(DISTINCT user_id) n FROM results WHERE challenge_id=? AND result_date=?",(challenge_id,summary_date)).fetchone()['n'])
+            rows=conn.execute("SELECT user_id FROM results WHERE challenge_id=? AND result_date=?",(challenge_id,summary_date)).fetchall()
+            names=[r['full_name'] for r in conn.execute("SELECT u.full_name FROM group_members gm JOIN users u ON u.telegram_id=gm.user_id LEFT JOIN results r ON r.challenge_id=? AND r.user_id=u.telegram_id AND r.result_date=? WHERE gm.group_id=? AND r.id IS NULL ORDER BY u.full_name",(challenge_id,summary_date,ch.group_id)).fetchall()]
+        leader_name=None; leader_score=0.0; total_score=0.0
+        for row in rows:
+            uid=int(row['user_id']); score=self.get_daily_score(challenge_id,uid,summary_date) or 0.0; total_score+=score
+            if leader_name is None or score>leader_score:
+                leader_score=score
+                with self._connect() as conn:
+                    u=conn.execute("SELECT full_name FROM users WHERE telegram_id=?",(uid,)).fetchone()
+                leader_name=u['full_name'] if u else str(uid)
+        totals=self.get_totals_by_exercise(challenge_id,summary_date)
+        repetitions=sum(float(r['total']) for r in totals)
+        return {'challenge':ch,'members':members,'active':active,'leader_name':leader_name,'leader_score':leader_score,'total_score':total_score,'repetitions':repetitions,'missing_names':names}
+
+    def get_active_challenges_for_summary(self, summary_date:str):
+        with self._connect() as conn:
+            return conn.execute("SELECT c.id,c.results_chat_id,g.telegram_chat_id FROM challenges c JOIN groups g ON g.id=c.group_id WHERE c.status='active' AND ? BETWEEN c.start_date AND c.end_date",(summary_date,)).fetchall()
+
+    def notification_sent(self, challenge_id:int, key:str)->bool:
+        with self._connect() as conn:
+            return conn.execute("SELECT 1 FROM notifications WHERE challenge_id=? AND notification_key=?",(challenge_id,key)).fetchone() is not None
+
+    def mark_notification_sent(self, challenge_id:int, key:str)->None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO notifications(challenge_id,notification_key) VALUES(?,?)",(challenge_id,key))
+
     def toggle_reminders(self,user_id:int)->bool:
         with self._connect() as conn:
             row=conn.execute("SELECT reminders_enabled FROM users WHERE telegram_id=?",(user_id,)).fetchone(); value=0 if row and row['reminders_enabled'] else 1

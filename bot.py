@@ -28,6 +28,8 @@ TIMEZONE=ZoneInfo(os.getenv('TIMEZONE','Europe/Moscow'))
 ADMIN_IDS={int(x) for x in os.getenv('ADMIN_IDS','').split(',') if x.strip().isdigit()}
 REMINDER_HOUR=22
 REMINDER_MINUTE=0
+SUMMARY_HOUR=22
+SUMMARY_MINUTE=5
 
 SOFT_TAUNTS=[
     '🥔 Пока остальные набирают очки, ты уверенно набираешь диванные часы.',
@@ -100,11 +102,13 @@ def result_challenge_choice(rows):
     ] for r in rows])
 
 def result_date_keyboard(edit_days:int,has_yesterday=False):
-    today=now().date(); rows=[]
-    for offset in range(0,edit_days+1):
-        d=today-timedelta(days=offset); label='Сегодня' if offset==0 else 'Вчера' if offset==1 else d.strftime('%d.%m')
-        rows.append([InlineKeyboardButton(text=label,callback_data=f'date:{d.isoformat()}')])
-    if has_yesterday: rows.append([InlineKeyboardButton(text='⚡ Повторить вчера',callback_data='repeat:yesterday')])
+    today=now().date(); rows=[[InlineKeyboardButton(text='Сегодня',callback_data=f'date:{today.isoformat()}')]]
+    # Результат за вчера можно внести или исправить только до 12:00.
+    if edit_days>=1 and now().hour<12:
+        yesterday=today-timedelta(days=1)
+        rows.append([InlineKeyboardButton(text='Вчера · до 12:00',callback_data=f'date:{yesterday.isoformat()}')])
+        if has_yesterday:
+            rows.append([InlineKeyboardButton(text='⚡ Повторить вчера',callback_data='repeat:yesterday')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def confirm_keyboard():
@@ -114,7 +118,7 @@ def resume_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='▶️ Продолжить',callback_data='draft:resume'),InlineKeyboardButton(text='🔄 Начать заново',callback_data='draft:restart')],[InlineKeyboardButton(text='❌ Отмена',callback_data='result:cancel')]])
 
 def saved_result_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✏️ Изменить результат',callback_data='saved:edit_today')],[InlineKeyboardButton(text='🏆 Рейтинг',callback_data='saved:rating'),InlineKeyboardButton(text='📊 Моя статистика',callback_data='saved:stats')]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Добавить ещё',callback_data='saved:edit_today')],[InlineKeyboardButton(text='🏆 Рейтинг',callback_data='saved:rating'),InlineKeyboardButton(text='📊 Моя статистика',callback_data='saved:stats')]])
 
 def admin_challenge_keyboard(challenge_id:int):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -304,14 +308,17 @@ async def begin_result_entry(target_message:Message,user_id:int,ch:Challenge,tar
     if not exercises:
         await target_message.answer('У челленджа нет упражнений.')
         return
-    values={str(k):float(v) for k,v in (prefill or {}).items()}
-    await state.update_data(challenge_id=ch.id,result_date=target.isoformat(),exercise_index=0,values=values)
+    # Повторное внесение результата является добавлением, а не заменой.
+    # Уже сохранённые значения храним отдельно, пользователь вводит только новую порцию.
+    base_values={str(k):float(v) for k,v in (prefill or {}).items()}
+    values={}
+    await state.update_data(challenge_id=ch.id,result_date=target.isoformat(),exercise_index=0,values=values,base_values=base_values)
     await state.set_state(ResultForm.collecting)
     db.save_result_draft(user_id,ch.id,target.isoformat(),0,values,'collecting')
     ex=exercises[0]
-    old=values.get(str(ex.id))
-    suffix=f' Текущее значение: <b>{fmt(old)}</b>.' if old is not None else ''
-    await target_message.answer(f'{escape(ex.name)} — сколько {escape(ex.unit)}? Норма: {fmt(ex.daily_target)}.{suffix}')
+    already=base_values.get(str(ex.id),0)
+    suffix=f' Уже за день: <b>{fmt(already)}</b> {escape(ex.unit)}.' if already>0 else ''
+    await target_message.answer(f'{escape(ex.name)} — сколько добавить сейчас? Норма: {fmt(ex.daily_target)}.{suffix}')
 
 @router.callback_query(F.data.startswith('date:'))
 async def result_date(callback:CallbackQuery,state:FSMContext):
@@ -320,6 +327,10 @@ async def result_date(callback:CallbackQuery,state:FSMContext):
     try: target=date.fromisoformat(callback.data.split(':',1)[1])
     except ValueError: return await callback.answer('Неверная дата',show_alert=True)
     if not (date.fromisoformat(ch.start_date)<=target<=date.fromisoformat(ch.end_date)): await callback.answer('Дата вне челленджа',show_alert=True); return
+    if target==now().date()-timedelta(days=1) and now().hour>=12:
+        await callback.answer('Результат за вчера можно внести только до 12:00',show_alert=True); return
+    if target<now().date()-timedelta(days=1):
+        await callback.answer('Можно внести результат только за сегодня или вчера',show_alert=True); return
     existing=db.get_result(ch.id,callback.from_user.id,target.isoformat()) or {}
     await callback.answer()
     await begin_result_entry(callback.message,callback.from_user.id,ch,target,state,existing)
@@ -333,17 +344,20 @@ async def resume_draft(callback:CallbackQuery,state:FSMContext):
     if not ch:
         db.delete_result_draft(callback.from_user.id); await callback.answer('Челлендж не найден',show_alert=True); return
     values={str(k):float(v) for k,v in draft.get('values',{}).items()}
+    base_values={str(k):float(v) for k,v in (db.get_result(ch.id,callback.from_user.id,draft['result_date']) or {}).items()}
     idx=int(draft.get('exercise_index',0)); exercises=db.get_exercises(ch.id)
-    await state.update_data(challenge_id=ch.id,result_date=draft['result_date'],exercise_index=idx,values=values)
+    await state.update_data(challenge_id=ch.id,result_date=draft['result_date'],exercise_index=idx,values=values,base_values=base_values)
     await callback.answer()
     if draft.get('stage')=='confirm' or idx>=len(exercises):
         await state.set_state(ResultForm.confirm)
-        await callback.message.answer(confirm_text(ch,values),reply_markup=confirm_keyboard())
+        await callback.message.answer(confirm_text(ch,values,base_values),reply_markup=confirm_keyboard())
     else:
         await state.set_state(ResultForm.collecting)
         ex=exercises[idx]
-        old=values.get(str(ex.id)); suffix=f' Текущее значение: <b>{fmt(old)}</b>.' if old is not None else ''
-        await callback.message.answer(f'{escape(ex.name)} — сколько {escape(ex.unit)}? Норма: {fmt(ex.daily_target)}.{suffix}')
+        already=base_values.get(str(ex.id),0); added=values.get(str(ex.id),0)
+        suffix=f' Уже за день: <b>{fmt(already)}</b> {escape(ex.unit)}.' if already>0 else ''
+        if added: suffix+=f' В черновике: <b>+{fmt(added)}</b>.'
+        await callback.message.answer(f'{escape(ex.name)} — сколько добавить сейчас? Норма: {fmt(ex.daily_target)}.{suffix}')
 
 @router.callback_query(F.data=='draft:restart')
 async def restart_draft(callback:CallbackQuery,state:FSMContext):
@@ -353,7 +367,7 @@ async def restart_draft(callback:CallbackQuery,state:FSMContext):
         await callback.answer('Черновик не найден',show_alert=True); return
     db.delete_result_draft(callback.from_user.id)
     await callback.answer()
-    await begin_result_entry(callback.message,callback.from_user.id,ch,date.fromisoformat(draft['result_date']),state,{})
+    await begin_result_entry(callback.message,callback.from_user.id,ch,date.fromisoformat(draft['result_date']),state,db.get_result(ch.id,callback.from_user.id,draft['result_date']) or {})
 
 @router.callback_query(F.data=='repeat:yesterday')
 async def repeat_yesterday(callback:CallbackQuery,state:FSMContext):
@@ -362,10 +376,11 @@ async def repeat_yesterday(callback:CallbackQuery,state:FSMContext):
     old=db.get_result(ch.id,callback.from_user.id,(now().date()-timedelta(days=1)).isoformat())
     if not old: await callback.answer('Нет результата за вчера',show_alert=True); return
     values={str(k):v for k,v in old.items()}
-    await state.update_data(result_date=now().date().isoformat(),values=values,exercise_index=len(db.get_exercises(ch.id)))
+    base_values={str(k):float(v) for k,v in (db.get_result(ch.id,callback.from_user.id,now().date().isoformat()) or {}).items()}
+    await state.update_data(result_date=now().date().isoformat(),values=values,base_values=base_values,exercise_index=len(db.get_exercises(ch.id)))
     await state.set_state(ResultForm.confirm)
     db.save_result_draft(callback.from_user.id,ch.id,now().date().isoformat(),len(db.get_exercises(ch.id)),values,'confirm')
-    await callback.answer(); await callback.message.answer(confirm_text(ch,old),reply_markup=confirm_keyboard())
+    await callback.answer(); await callback.message.answer(confirm_text(ch,old,base_values),reply_markup=confirm_keyboard())
 
 def parse_value(message:Message,target:float)->tuple[float|None,str|None]:
     try: v=float((message.text or '').replace(',','.'))
@@ -375,13 +390,20 @@ def parse_value(message:Message,target:float)->tuple[float|None,str|None]:
     if v>safe_max:return None,f'Слишком большое значение. Максимум для ввода: {fmt(safe_max)}.'
     return v,None
 
-def confirm_text(ch:Challenge,values:dict[int|str,float])->str:
-    exercises=db.get_exercises(ch.id); normalized={int(k):float(v) for k,v in values.items()}; lines=['<b>Проверка результата:</b>','']
+def confirm_text(ch:Challenge,values:dict[int|str,float],base_values:dict[int|str,float]|None=None)->str:
+    exercises=db.get_exercises(ch.id)
+    added={int(k):float(v) for k,v in values.items()}
+    base={int(k):float(v) for k,v in (base_values or {}).items()}
+    totals={e.id:base.get(e.id,0)+added.get(e.id,0) for e in exercises}
+    lines=['<b>Проверка добавления:</b>','']
     for e in exercises:
-        v=normalized.get(e.id,0)
-        lines.append(f'• {escape(e.name)}: <b>{fmt(v)}</b> {escape(e.unit)}')
-    points=db.calculate_daily_score(ch.id,normalized)
-    lines.append(f'\nБаллы: <b>{points:.2f}</b> из {fmt(sum(e.max_points for e in exercises))}')
+        before=base.get(e.id,0); plus=added.get(e.id,0); total=totals[e.id]
+        if before>0:
+            lines.append(f'• {escape(e.name)}: {fmt(before)} + <b>{fmt(plus)}</b> = <b>{fmt(total)}</b> {escape(e.unit)}')
+        else:
+            lines.append(f'• {escape(e.name)}: <b>{fmt(plus)}</b> {escape(e.unit)}')
+    points=db.calculate_daily_score(ch.id,totals)
+    lines.append(f'\nИтоговые баллы за день: <b>{points:.2f}</b> из {fmt(sum(e.max_points for e in exercises))}')
     return '\n'.join(lines)
 
 @router.message(ResultForm.collecting)
@@ -391,10 +413,10 @@ async def collect_result(message:Message,state:FSMContext):
     if not ch:
         draft=db.get_result_draft(message.from_user.id)
         if not draft:return await message.answer('Форма устарела. Нажмите «📝 Внести результат».')
-        ch=db.get_challenge(int(draft['challenge_id'])); d={'challenge_id':draft['challenge_id'],'result_date':draft['result_date'],'exercise_index':draft['exercise_index'],'values':draft['values']}
+        ch=db.get_challenge(int(draft['challenge_id'])); d={'challenge_id':draft['challenge_id'],'result_date':draft['result_date'],'exercise_index':draft['exercise_index'],'values':draft['values'],'base_values':{str(k):v for k,v in (db.get_result(int(draft['challenge_id']),message.from_user.id,draft['result_date']) or {}).items()}}
     exercises=db.get_exercises(ch.id); idx=int(d.get('exercise_index',0))
     if idx>=len(exercises):
-        await state.set_state(ResultForm.confirm); return await message.answer(confirm_text(ch,d.get('values',{})),reply_markup=confirm_keyboard())
+        await state.set_state(ResultForm.confirm); return await message.answer(confirm_text(ch,d.get('values',{}),d.get('base_values',{})),reply_markup=confirm_keyboard())
     ex=exercises[idx]; value,error=parse_value(message,ex.daily_target)
     if error: await message.answer(error); return
     values={str(k):v for k,v in d.get('values',{}).items()}; values[str(ex.id)]=value; idx+=1
@@ -402,12 +424,15 @@ async def collect_result(message:Message,state:FSMContext):
         nxt=exercises[idx]
         await state.update_data(values=values,exercise_index=idx)
         db.save_result_draft(message.from_user.id,ch.id,d['result_date'],idx,values,'collecting')
-        old=values.get(str(nxt.id)); suffix=f' Текущее значение: <b>{fmt(old)}</b>.' if old is not None else ''
-        await message.answer(f'{escape(nxt.name)} — сколько {escape(nxt.unit)}? Норма: {fmt(nxt.daily_target)}.{suffix}')
+        base_values={str(k):float(v) for k,v in d.get('base_values',{}).items()}
+        already=base_values.get(str(nxt.id),0); added=values.get(str(nxt.id),0)
+        suffix=f' Уже за день: <b>{fmt(already)}</b> {escape(nxt.unit)}.' if already>0 else ''
+        if added: suffix+=f' В черновике: <b>+{fmt(added)}</b>.'
+        await message.answer(f'{escape(nxt.name)} — сколько добавить сейчас? Норма: {fmt(nxt.daily_target)}.{suffix}')
     else:
         await state.update_data(values=values,exercise_index=idx); await state.set_state(ResultForm.confirm)
         db.save_result_draft(message.from_user.id,ch.id,d['result_date'],idx,values,'confirm')
-        await message.answer(confirm_text(ch,values),reply_markup=confirm_keyboard())
+        await message.answer(confirm_text(ch,values,d.get('base_values',{})),reply_markup=confirm_keyboard())
 
 @router.callback_query(F.data=='result:save')
 async def save(callback:CallbackQuery,state:FSMContext):
@@ -417,22 +442,47 @@ async def save(callback:CallbackQuery,state:FSMContext):
         if draft:d={'challenge_id':draft['challenge_id'],'result_date':draft['result_date'],'values':draft['values']}
         else:return await callback.answer('Форма устарела. Внесите результат заново.',show_alert=True)
     try:
-        values={int(k):float(v) for k,v in d['values'].items()}; ch=db.get_challenge(int(d['challenge_id']))
+        additions={int(k):float(v) for k,v in d['values'].items()}; ch=db.get_challenge(int(d['challenge_id']))
         if not ch:raise ValueError('Челлендж не найден')
         db.upsert_user(callback.from_user.id,callback.from_user.full_name,callback.from_user.username)
+        previous_best,previous_best_date=db.get_personal_best_before(ch.id,callback.from_user.id,d['result_date'])
+        current=db.get_result(ch.id,callback.from_user.id,d['result_date']) or {}
+        values={e.id:float(current.get(e.id,0))+float(additions.get(e.id,0)) for e in db.get_exercises(ch.id)}
+        if not any(v>0 for v in additions.values()):
+            raise ValueError('Добавьте хотя бы один результат больше нуля')
         db.save_result(ch.id,callback.from_user.id,d['result_date'],values)
         daily=db.calculate_daily_score(ch.id,values)
+        is_personal_best=daily>previous_best+0.0001
+        achievements=db.evaluate_achievements(ch.id,callback.from_user.id,d['result_date'],daily,is_personal_best)
         db.delete_result_draft(callback.from_user.id); await state.clear(); await callback.answer('Сохранено')
         if callback.message:
             try:await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:pass
         exercise_lines='\n'.join(f'• {escape(e.name)}: <b>{fmt(values.get(e.id,0))}</b> {escape(e.unit)}' for e in db.get_exercises(ch.id))
         try:
-            s=db.get_user_stats(ch.id,callback.from_user.id); place,total=db.get_user_rank(ch.id,callback.from_user.id); current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat())
-            text=(f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n⭐ Всего: <b>{float(s["points"]):.2f}</b>\n🏆 Место: <b>{place or "—"} из {total}</b>\n🔥 Серия: <b>{current}</b> · рекорд: <b>{longest}</b>\n\n{random.choice(SUCCESS_TAUNTS)}')
+            s=db.get_user_stats(ch.id,callback.from_user.id); place,total=db.get_user_rank(ch.id,callback.from_user.id); current,longest=db.calculate_streaks(ch.id,callback.from_user.id,d['result_date'])
+            if is_personal_best and previous_best_date:
+                record_line=f'\n🚀 <b>Новый личный рекорд!</b> Предыдущий: {previous_best:.2f}'
+            elif is_personal_best:
+                record_line='\n🚀 <b>Первый результат — стартовая точка для рекорда.</b>'
+            else:
+                record_line=f'\nДо личного рекорда: <b>{max(0,previous_best-daily):.2f}</b>'
+            achievement_lines=''.join(f'\n🏅 <b>{escape(title)}</b> — {escape(description)}' for title,description in achievements)
+            text=(f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n⭐ Всего: <b>{float(s["points"]):.2f}</b>\n🏆 Место: <b>{place or "—"} из {total}</b>\n🔥 Серия: <b>{current}</b> · рекорд: <b>{longest}</b>{record_line}{achievement_lines}\n\n{random.choice(SUCCESS_TAUNTS)}')
         except Exception:
             logging.exception('Result saved, but statistics calculation failed'); text=f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n\n{random.choice(SUCCESS_TAUNTS)}'
         await callback.message.answer(text,reply_markup=saved_result_keyboard())
+        if achievements:
+            g=db.get_group(ch.group_id)
+            if g:
+                for title,description in achievements:
+                    try:
+                        achievement_text=(f'🏅 <b>Новое достижение!</b>\n\n'
+                                          f'{escape(callback.from_user.full_name)} получил:\n'
+                                          f'<b>{escape(title)}</b>\n{escape(description)}')
+                        await callback.bot.send_message(g.telegram_chat_id,achievement_text)
+                    except Exception:
+                        logging.exception('Failed to announce achievement')
     except Exception as exc:
         logging.exception('Unable to save result'); await callback.answer('Не удалось сохранить результат',show_alert=True)
         if callback.message:await callback.message.answer(f'❌ Результат не сохранён. Ошибка: <code>{escape(str(exc))}</code>\nПопробуйте внести результат ещё раз.')
@@ -833,13 +883,49 @@ async def reminder_worker(bot:Bot):
         else:
             await asyncio.sleep(20)
 
+def daily_summary_text(summary:dict)->str:
+    missing=summary['missing_names']
+    missing_text=', '.join(escape(x) for x in missing[:10]) if missing else 'никто — отличный день'
+    if len(missing)>10:
+        missing_text+=f' и ещё {len(missing)-10}'
+    leader=(f"{escape(summary['leader_name'])} — {summary['leader_score']:.2f} балла" if summary['leader_name'] else 'сегодня пока нет')
+    return (f"🔥 <b>Итоги дня · {escape(summary['challenge'].title)}</b>\n\n"
+            f"✅ Отметились: <b>{summary['active']} из {summary['members']}</b>\n"
+            f"🏋️ Всего выполнено: <b>{summary['repetitions']:.0f}</b>\n"
+            f"⭐ Баллов за день: <b>{summary['total_score']:.2f}</b>\n"
+            f"🏆 Лидер дня: <b>{leader}</b>\n\n"
+            f"Сегодня пропустили: {missing_text}")
+
+async def summary_worker(bot:Bot):
+    while True:
+        current=now()
+        if current.hour==SUMMARY_HOUR and current.minute==SUMMARY_MINUTE:
+            day=current.date().isoformat()
+            for row in db.get_active_challenges_for_summary(day):
+                cid=int(row['id']); key=f'daily_summary:{day}'
+                if db.notification_sent(cid,key):
+                    continue
+                try:
+                    summary=db.get_daily_summary(cid,day)
+                    chat_id=int(row['results_chat_id'] or row['telegram_chat_id'])
+                    if summary:
+                        await bot.send_message(chat_id,daily_summary_text(summary))
+                    db.mark_notification_sent(cid,key)
+                except Exception:
+                    logging.exception('Failed to send daily summary for challenge %s',cid)
+            await asyncio.sleep(65)
+        else:
+            await asyncio.sleep(20)
+
 async def main():
     logging.basicConfig(level=logging.INFO); db.init(); bot=Bot(BOT_TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(storage=MemoryStorage()); dp.include_router(router)
     await bot.set_my_commands([BotCommand(command='start',description='Открыть меню'),BotCommand(command='rating',description='Рейтинг группы'),BotCommand(command='stats',description='Статистика группы'),BotCommand(command='id',description='ID чата')])
     reminder_task=asyncio.create_task(reminder_worker(bot))
+    summary_task=asyncio.create_task(summary_worker(bot))
     try:
         await dp.start_polling(bot)
     finally:
         reminder_task.cancel()
+        summary_task.cancel()
 
 if __name__=='__main__': asyncio.run(main())
