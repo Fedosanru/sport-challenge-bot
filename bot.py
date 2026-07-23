@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import sqlite3
 from datetime import date, datetime, timedelta
 from html import escape
@@ -25,6 +26,36 @@ BOT_TOKEN=os.getenv('BOT_TOKEN','')
 DATABASE_PATH=os.getenv('DATABASE_PATH','sport_challenge.db')
 TIMEZONE=ZoneInfo(os.getenv('TIMEZONE','Europe/Moscow'))
 ADMIN_IDS={int(x) for x in os.getenv('ADMIN_IDS','').split(',') if x.strip().isdigit()}
+REMINDER_HOUR=22
+REMINDER_MINUTE=0
+
+SOFT_TAUNTS=[
+    '🥔 Пока остальные набирают очки, ты уверенно набираешь диванные часы.',
+    '🛋️ Диван просил передать спасибо за ещё один прекрасный вечер вместе.',
+    '📉 Такими темпами скоро появится рейтинг «Самый перспективный наблюдатель».',
+    '🦥 Ленивец посмотрел на твою активность и сказал: «Ну это уже перебор».',
+    '🚨 До конца дня осталось совсем немного, а результат пока выглядит как красивый круглый ноль.',
+    '🏆 Лидеры уже закончили тренировку. Ты пока размышляешь, стоит ли вставать.',
+    '🤔 Бот проверил: кнопка «Внести результат» работает. Теперь твоя очередь.',
+    '📢 Срочная новость: диван пока побеждает со счётом 1:0.',
+]
+THREE_DAY_TAUNTS=[
+    '🚑 Третий день без результата. Мы уже хотели отправлять поисковую экспедицию.',
+    '📦 Похоже, ты решил сохранить силы до следующего сезона. Но этот ещё идёт.',
+    '🦴 Мышцы начинают забывать, как тебя зовут. Напомни им тренировкой.',
+]
+SEVEN_DAY_TAUNTS=[
+    '👻 Неделя без результата. Ты ещё участник челленджа или уже городская легенда?',
+    '📸 Последний раз тебя видели тренирующимся неделю назад. Есть шанс опровергнуть слухи.',
+    '🕵️ Бот ведёт расследование: куда исчез спортсмен? Главная версия — диван.',
+]
+SUCCESS_TAUNTS=[
+    '😂 Ладно, беру свои слова обратно. Молодец.',
+    '👏 Вот теперь можно жить дальше.',
+    '💪 Всё, претензий нет. До завтра.',
+    '🔥 Результат принят. Сегодня диван остался без победы.',
+    '🏅 Засчитано. Можешь гордиться собой ближайшие семь минут.',
+]
 if not BOT_TOKEN: raise RuntimeError('BOT_TOKEN is not set')
 
 db=Database(DATABASE_PATH); router=Router()
@@ -111,6 +142,17 @@ async def ensure_group(message:Message)->Group:
         role='admin' if (await message.bot.get_chat_member(message.chat.id,message.from_user.id)).status in {'administrator','creator'} else 'member'
         db.add_member(g.id,message.from_user.id,role)
     return g
+
+def active_challenge_for_group(g:Group)->Challenge|None:
+    ch=db.get_active_challenge(g.id)
+    if ch:return ch
+    # Compatibility with old databases where the challenge was linked only
+    # through results_chat_id or to a duplicate group row.
+    ch=db.get_active_challenge_by_chat(g.telegram_chat_id)
+    if ch and ch.group_id!=g.id:
+        db.repair_challenge_group_link(ch.id,g.id,g.telegram_chat_id)
+        ch=db.get_challenge(ch.id)
+    return ch
 
 def rules_text(ch:Challenge)->str:
     exercises=db.get_exercises(ch.id)
@@ -381,9 +423,9 @@ async def save(callback:CallbackQuery,state:FSMContext):
         exercise_lines='\n'.join(f'• {escape(e.name)}: <b>{fmt(values.get(e.id,0))}</b> {escape(e.unit)}' for e in db.get_exercises(ch.id))
         try:
             s=db.get_user_stats(ch.id,callback.from_user.id); place,total=db.get_user_rank(ch.id,callback.from_user.id); current,longest=db.calculate_streaks(ch.id,callback.from_user.id,now().date().isoformat())
-            text=(f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n⭐ Всего: <b>{float(s["points"]):.2f}</b>\n🏆 Место: <b>{place or "—"} из {total}</b>\n🔥 Серия: <b>{current}</b> · рекорд: <b>{longest}</b>')
+            text=(f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n⭐ Всего: <b>{float(s["points"]):.2f}</b>\n🏆 Место: <b>{place or "—"} из {total}</b>\n🔥 Серия: <b>{current}</b> · рекорд: <b>{longest}</b>\n\n{random.choice(SUCCESS_TAUNTS)}')
         except Exception:
-            logging.exception('Result saved, but statistics calculation failed'); text=f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>'
+            logging.exception('Result saved, but statistics calculation failed'); text=f'✅ <b>Результат сохранён</b>\n\n{exercise_lines}\n\n🏅 За день: <b>{daily:.2f}</b>\n\n{random.choice(SUCCESS_TAUNTS)}'
         await callback.message.answer(text,reply_markup=saved_result_keyboard())
     except Exception as exc:
         logging.exception('Unable to save result'); await callback.answer('Не удалось сохранить результат',show_alert=True)
@@ -429,19 +471,19 @@ async def cancel(callback:CallbackQuery,state:FSMContext):
 
 @router.callback_query(F.data.startswith('public_rating:'))
 async def public_rating(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=db.get_active_challenge(gid); me=await callback.bot.get_me()
+    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g) if g else None; me=await callback.bot.get_me()
     if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
     await callback.message.edit_text(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'rating')); await callback.answer()
 
 @router.callback_query(F.data.startswith('public_rules:'))
 async def public_rules(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=db.get_active_challenge(gid); me=await callback.bot.get_me()
+    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g) if g else None; me=await callback.bot.get_me()
     if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
     await callback.message.edit_text(rules_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'rating')); await callback.answer()
 
 @router.callback_query(F.data.startswith('public_stats:'))
 async def public_stats(callback:CallbackQuery):
-    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=db.get_active_challenge(gid); me=await callback.bot.get_me()
+    gid=int(callback.data.split(':')[1]); g=db.get_group(gid); ch=active_challenge_for_group(g) if g else None; me=await callback.bot.get_me()
     if not g or not callback.message or callback.message.chat.id!=g.telegram_chat_id:return await callback.answer('Группа не найдена',show_alert=True)
     await callback.message.edit_text(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,gid,'stats')); await callback.answer()
 
@@ -452,7 +494,7 @@ async def rating(message:Message):
         if not message.from_user:return
         _,ch=selected(message.from_user.id); await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard())
     else:
-        g=await ensure_group(message); ch=db.get_active_challenge(g.id); me=await message.bot.get_me(); await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id))
+        g=await ensure_group(message); ch=active_challenge_for_group(g); me=await message.bot.get_me(); await message.answer(ranking_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id))
 
 @router.message(F.text=='📊 Статистика челленджа')
 @router.message(Command('stats'))
@@ -460,7 +502,7 @@ async def stats(message:Message):
     if private(message):
         _,ch=selected(message.from_user.id); await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=main_keyboard())
     else:
-        g=await ensure_group(message); ch=db.get_active_challenge(g.id); me=await message.bot.get_me(); await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'stats'))
+        g=await ensure_group(message); ch=active_challenge_for_group(g); me=await message.bot.get_me(); await message.answer(group_stats_text(ch) if ch else 'В этой группе нет активного челленджа.',reply_markup=group_keyboard(me.username,g.id,'stats'))
 
 @router.message(F.text=='📊 Моя статистика')
 async def my_stats(message:Message):
@@ -478,7 +520,12 @@ async def rules(message:Message):
 
 @router.message(F.text=='🔔 Напоминания')
 async def reminders(message:Message):
-    if private(message) and message.from_user: await message.answer('🔔 Напоминания включены.' if db.toggle_reminders(message.from_user.id) else '🔕 Напоминания выключены.')
+    if private(message) and message.from_user:
+        enabled=db.toggle_reminders(message.from_user.id)
+        await message.answer(
+            '🔔 Напоминания включены. Жёсткий тренер напишет в <b>22:00</b>, только если результат за день не внесён.'
+            if enabled else '🔕 Напоминания выключены.'
+        )
 
 @router.message(F.text=='🛠 Управление группой')
 async def manage(message:Message):
@@ -734,9 +781,46 @@ async def ids(message:Message): await message.answer(f'ID чата: <code>{messa
 async def ignore_group_messages(message: Message):
     return
 
+def reminder_text(missed_days:int,challenge_title:str,group_title:str)->str:
+    if missed_days>=7: phrase=random.choice(SEVEN_DAY_TAUNTS)
+    elif missed_days>=3: phrase=random.choice(THREE_DAY_TAUNTS)
+    else: phrase=random.choice(SOFT_TAUNTS)
+    anger=min(100,20+missed_days*10)
+    filled=min(10,max(1,round(anger/10)))
+    meter='█'*filled+'░'*(10-filled)
+    return (f'<b>😈 Жёсткий тренер</b> · {escape(group_title)}\n'
+            f'Челлендж: <b>{escape(challenge_title)}</b>\n\n{phrase}\n\n'
+            f'😡 Тренер зол\n<code>{meter}</code> {anger}%\n\n'
+            'Нажми «📝 Внести результат» в меню бота.')
+
+async def reminder_worker(bot:Bot):
+    """Send one private reminder at 22:00 Moscow time to users without a result."""
+    while True:
+        current=now()
+        if current.hour==REMINDER_HOUR and current.minute==REMINDER_MINUTE:
+            day=current.date().isoformat()
+            for row in db.get_pending_reminders(day):
+                try:
+                    missed=db.get_missed_days(int(row['challenge_id']),int(row['user_id']),day)
+                    await bot.send_message(
+                        int(row['user_id']),
+                        reminder_text(missed,str(row['challenge_title']),str(row['group_title'])),
+                        reply_markup=main_keyboard(),
+                    )
+                    db.mark_reminder_sent(int(row['challenge_id']),int(row['user_id']),day)
+                except Exception:
+                    logging.exception('Failed to send reminder to user %s',row['user_id'])
+            await asyncio.sleep(65)
+        else:
+            await asyncio.sleep(20)
+
 async def main():
     logging.basicConfig(level=logging.INFO); db.init(); bot=Bot(BOT_TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(storage=MemoryStorage()); dp.include_router(router)
     await bot.set_my_commands([BotCommand(command='start',description='Открыть меню'),BotCommand(command='rating',description='Рейтинг группы'),BotCommand(command='stats',description='Статистика группы'),BotCommand(command='id',description='ID чата')])
-    await dp.start_polling(bot)
+    reminder_task=asyncio.create_task(reminder_worker(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        reminder_task.cancel()
 
 if __name__=='__main__': asyncio.run(main())

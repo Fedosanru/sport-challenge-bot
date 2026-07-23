@@ -153,6 +153,13 @@ class Database:
                 stage TEXT NOT NULL DEFAULT 'collecting',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS reminder_log(
+                challenge_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                reminder_date TEXT NOT NULL,
+                sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(challenge_id,user_id,reminder_date)
+            );
             """)
             if "group_id" not in self._cols(conn, "challenges"):
                 conn.execute("ALTER TABLE challenges ADD COLUMN group_id INTEGER")
@@ -468,6 +475,61 @@ class Database:
         end=date.fromisoformat(through_date); current=0; s=set(dates)
         while end in s: current+=1; end-=timedelta(days=1)
         return current,longest
+
+    def get_active_challenge_by_chat(self,chat_id:int)->Challenge|None:
+        """Find the active season for a Telegram group, including legacy rows."""
+        with self._connect() as conn:
+            row=conn.execute("""
+                SELECT c.id,c.group_id,c.title,c.start_date,c.end_date,c.status,c.results_chat_id,
+                       c.scoring_mode,c.over_target_mode,c.success_mode,c.min_daily_points,
+                       c.edit_days,c.join_mode,c.rules_locked
+                FROM challenges c
+                LEFT JOIN groups g ON g.id=c.group_id
+                WHERE c.status='active' AND (g.telegram_chat_id=? OR c.results_chat_id=?)
+                ORDER BY CASE WHEN g.telegram_chat_id=? THEN 0 ELSE 1 END,c.id DESC
+                LIMIT 1
+            """,(chat_id,chat_id,chat_id)).fetchone()
+        return self._challenge_from_row(row)
+
+    def repair_challenge_group_link(self,challenge_id:int,group_id:int,chat_id:int)->None:
+        """Attach a legacy challenge to the canonical group row for this chat."""
+        with self._connect() as conn:
+            conn.execute("UPDATE challenges SET group_id=?,results_chat_id=COALESCE(results_chat_id,?) WHERE id=?",
+                         (group_id,chat_id,challenge_id))
+
+    def get_pending_reminders(self,reminder_date:str):
+        with self._connect() as conn:
+            return conn.execute("""
+                SELECT c.id challenge_id,c.title challenge_title,c.group_id,g.title group_title,
+                       u.telegram_id user_id,u.full_name
+                FROM challenges c
+                JOIN groups g ON g.id=c.group_id
+                JOIN group_members gm ON gm.group_id=c.group_id
+                JOIN users u ON u.telegram_id=gm.user_id AND u.reminders_enabled=1
+                LEFT JOIN results r ON r.challenge_id=c.id AND r.user_id=u.telegram_id AND r.result_date=?
+                LEFT JOIN reminder_log rl ON rl.challenge_id=c.id AND rl.user_id=u.telegram_id AND rl.reminder_date=?
+                WHERE c.status='active' AND ? BETWEEN c.start_date AND c.end_date
+                  AND r.id IS NULL AND rl.user_id IS NULL
+                ORDER BY c.id,u.telegram_id
+            """,(reminder_date,reminder_date,reminder_date)).fetchall()
+
+    def get_missed_days(self,challenge_id:int,user_id:int,through_date:str)->int:
+        ch=self.get_challenge(challenge_id)
+        if not ch:return 0
+        start=date.fromisoformat(ch.start_date); end=min(date.fromisoformat(through_date),date.fromisoformat(ch.end_date))
+        with self._connect() as conn:
+            done={date.fromisoformat(r['result_date']) for r in conn.execute(
+                "SELECT result_date FROM results WHERE challenge_id=? AND user_id=? AND result_date BETWEEN ? AND ?",
+                (challenge_id,user_id,start.isoformat(),end.isoformat()))}
+        missed=0; d=end
+        while d>=start and d not in done:
+            missed+=1; d-=timedelta(days=1)
+        return missed
+
+    def mark_reminder_sent(self,challenge_id:int,user_id:int,reminder_date:str)->None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO reminder_log(challenge_id,user_id,reminder_date) VALUES(?,?,?)",
+                         (challenge_id,user_id,reminder_date))
 
     def toggle_reminders(self,user_id:int)->bool:
         with self._connect() as conn:
